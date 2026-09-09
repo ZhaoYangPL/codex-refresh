@@ -60,6 +60,56 @@ const fn default_enabled() -> bool {
     true
 }
 
+/// Selects the context-limit timing behavior used by the Phase 8 experiment host.
+#[derive(Serialize, Deserialize, Debug, Default, Copy, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextPolicyMode {
+    /// Preserve the pinned upstream pre-turn and mid-turn context-limit behavior.
+    #[default]
+    NativeFixed,
+    /// Use the canonical pre-invocation seam with a fixed token threshold.
+    ControlledFixed,
+    /// Use a deterministic in-process stand-in for a future external policy bridge.
+    ExternalStub,
+}
+
+/// Deterministic policy used to validate the external-policy side of the Phase 8A seam.
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalContextPolicyStub {
+    AlwaysKeep,
+    CompactAtEpoch,
+}
+
+/// Experimental context-policy configuration for the pinned Codex research fork.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(default)]
+pub struct ContextPolicyConfig {
+    pub mode: ContextPolicyMode,
+    pub fixed_threshold_tokens: Option<i64>,
+    pub external_stub: Option<ExternalContextPolicyStub>,
+    pub external_stub_compact_at_epoch: Option<u64>,
+    pub run_id: Option<String>,
+    pub task_id: Option<String>,
+    pub replicate_id: Option<u64>,
+    pub raw_log_path: Option<AbsolutePathBuf>,
+}
+
+impl Default for ContextPolicyConfig {
+    fn default() -> Self {
+        Self {
+            mode: ContextPolicyMode::NativeFixed,
+            fixed_threshold_tokens: None,
+            external_stub: None,
+            external_stub_compact_at_epoch: None,
+            run_id: None,
+            task_id: None,
+            replicate_id: None,
+            raw_log_path: None,
+        }
+    }
+}
+
 /// Preferred layout for the resume/fork session picker.
 #[derive(Serialize, Deserialize, Debug, Default, Copy, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]

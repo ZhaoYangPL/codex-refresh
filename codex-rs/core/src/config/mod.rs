@@ -39,6 +39,7 @@ use codex_config::sandbox_mode_requirement_for_permission_profile;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_config::types::AuthKeyringBackendKind;
+use codex_config::types::ContextPolicyConfig;
 use codex_config::types::History;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerDisabledReason;
@@ -632,6 +633,9 @@ pub struct Config {
     /// Controls whether `model_auto_compact_token_limit` applies to the full
     /// active context or only tokens after the carried compaction-window prefix.
     pub model_auto_compact_token_limit_scope: AutoCompactTokenLimitScope,
+
+    /// Experimental context-limit policy used by the pinned Phase 8 research fork.
+    pub experimental_context_policy: ContextPolicyConfig,
 
     /// Key into the model_providers map that specifies which provider to use.
     pub model_provider_id: String,
@@ -3708,6 +3712,14 @@ impl Config {
         let code_mode = resolve_code_mode_config(&cfg);
         let multi_agent_v2 = resolve_multi_agent_v2_config(&cfg);
         let token_budget = resolve_token_budget_config(&cfg, &features)?;
+        let experimental_context_policy = cfg
+            .experimental_context_policy
+            .clone()
+            .unwrap_or_default();
+        crate::context_policy::validate_config(
+            &experimental_context_policy,
+            features.enabled(Feature::TokenBudget),
+        )?;
         let rollout_budget = resolve_rollout_budget_config(&cfg, &features)?;
         let current_time_reminder = resolve_current_time_reminder_config(&cfg, &features)?;
         let sleep_tool_mode = cfg
@@ -4160,6 +4172,7 @@ impl Config {
             model_auto_compact_token_limit_scope: cfg
                 .model_auto_compact_token_limit_scope
                 .unwrap_or_default(),
+            experimental_context_policy,
             model_provider_id,
             model_provider,
             cwd: resolved_cwd,

@@ -1164,6 +1164,87 @@
       },
       "type": "object"
     },
+    "ContextPolicyConfig": {
+      "description": "Experimental context-policy configuration for the pinned Codex research fork.",
+      "properties": {
+        "external_stub": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExternalContextPolicyStub"
+            }
+          ],
+          "default": null
+        },
+        "external_stub_compact_at_epoch": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "fixed_threshold_tokens": {
+          "default": null,
+          "format": "int64",
+          "type": "integer"
+        },
+        "mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ContextPolicyMode"
+            }
+          ],
+          "default": "native_fixed"
+        },
+        "raw_log_path": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "default": null
+        },
+        "replicate_id": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "run_id": {
+          "default": null,
+          "type": "string"
+        },
+        "task_id": {
+          "default": null,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "ContextPolicyMode": {
+      "description": "Selects the context-limit timing behavior used by the Phase 8 experiment host.",
+      "oneOf": [
+        {
+          "description": "Preserve the pinned upstream pre-turn and mid-turn context-limit behavior.",
+          "enum": [
+            "native_fixed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Use the canonical pre-invocation seam with a fixed token threshold.",
+          "enum": [
+            "controlled_fixed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Use a deterministic in-process stand-in for a future external policy bridge.",
+          "enum": [
+            "external_stub"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "CurrentTimeReminderConfigToml": {
       "additionalProperties": false,
       "properties": {
@@ -1256,6 +1337,14 @@
         }
       },
       "type": "object"
+    },
+    "ExternalContextPolicyStub": {
+      "description": "Deterministic policy used to validate the external-policy side of the Phase 8A seam.",
+      "enum": [
+        "always_keep",
+        "compact_at_epoch"
+      ],
+      "type": "string"
     },
     "FeatureToml_for_CodeModeConfigToml": {
       "anyOf": [
@@ -5980,6 +6069,14 @@
     },
     "experimental_compact_prompt_file": {
       "$ref": "#/definitions/AbsolutePathBuf"
+    },
+    "experimental_context_policy": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ContextPolicyConfig"
+        }
+      ],
+      "description": "Phase 8 research-fork configuration. Defaults to upstream-parity `native_fixed`."
     },
     "experimental_realtime_start_instructions": {
       "description": "Experimental / do not use. Replaces the built-in realtime start instructions inserted into developer messages when realtime becomes active.",

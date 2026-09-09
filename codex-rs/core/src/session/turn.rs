@@ -14,6 +14,9 @@ use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_
 use crate::connectors;
 use crate::context::ContextualUserFragment;
 use crate::context::UserVerificationNotice;
+use crate::context_policy::ContextPolicyAction;
+use crate::context_policy::ContextPolicyObservation;
+use crate::context_policy::ContextPolicySeam;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::feedback_tags;
 use crate::hook_runtime::drain_async_hook_results;
@@ -173,6 +176,8 @@ pub(crate) async fn run_turn(
 
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    let mut context_policy =
+        ContextPolicySeam::new(turn_context.config.experimental_context_policy.clone());
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
@@ -438,6 +443,11 @@ pub(crate) async fn run_turn(
                 &mut client_session,
                 &responses_metadata,
                 sampling_request_input,
+                &mut context_policy,
+                InitialContextInjection::BeforeLastUserMessage {
+                    world_state: Arc::clone(&world_state),
+                    step_context: Arc::clone(&step_context),
+                },
                 cancellation_token.child_token(),
             )
             .await
@@ -507,7 +517,9 @@ pub(crate) async fn run_turn(
                     );
                 }
 
-                let should_roll_over = needs_follow_up
+                let should_roll_over = crate::context_policy::native_context_limit_enabled(
+                    &turn_context.config.experimental_context_policy,
+                ) && needs_follow_up
                     && (sess.take_new_context_window_request().await || token_limit_reached);
                 let allow_auto_compact_fallback = !should_roll_over && !token_limit_reached;
                 super::token_budget::maybe_record(
@@ -1098,6 +1110,11 @@ async fn run_pre_sampling_compact(
 ) -> CodexResult<()> {
     maybe_run_previous_model_inline_compact(sess, turn_context, client_session, cancellation_token)
         .await?;
+    if !crate::context_policy::native_context_limit_enabled(
+        &turn_context.config.experimental_context_policy,
+    ) {
+        return Ok(());
+    }
     let token_status =
         super::context_window::context_window_token_status(sess.as_ref(), turn_context.as_ref())
             .await;
@@ -1427,6 +1444,8 @@ async fn run_sampling_request(
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     input: Vec<ResponseItem>,
+    context_policy: &mut ContextPolicySeam,
+    context_policy_initial_context_injection: InitialContextInjection,
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
     let turn_context = Arc::clone(&step_context.turn);
@@ -1447,6 +1466,10 @@ async fn run_sampling_request(
     let mut initial_input = Some(input);
     let mut original_input = None;
     let mut executed_tool_calls_by_output = HashMap::new();
+    let thread_id = sess.thread_id.to_string();
+    let mut context_policy_pending = true;
+    let mut context_policy_initial_context_injection =
+        Some(context_policy_initial_context_injection);
     loop {
         // A retry must not attribute the next tool call to the previous response.
         turn_context
@@ -1466,11 +1489,89 @@ async fn run_sampling_request(
         {
             codex_protocol::models::bound_executed_tool_calls_for_prompt(&mut prompt_input);
         }
-        let prompt = build_prompt(
+        let mut prompt = build_prompt(
             prompt_input,
             step_context.as_ref(),
             base_instructions.clone(),
         );
+        let decision = if context_policy_pending && context_policy.is_controlled() {
+            context_policy_pending = false;
+            let epoch = sess
+                .next_context_policy_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let model_visible_request = client_session.model_visible_context_snapshot(
+                &prompt,
+                &step_context.settings.model_info,
+                responses_metadata,
+            )?;
+            let observation = ContextPolicyObservation::new(
+                &prompt,
+                model_visible_request,
+                &step_context.settings.model_info,
+                &thread_id,
+                &turn_context.sub_id,
+                &turn_context.config.model_provider_id,
+            );
+            context_policy.decide(epoch, observation).await?
+        } else {
+            None
+        };
+        if let Some(decision) = decision {
+            if decision.action == ContextPolicyAction::Compact {
+                let Some(initial_context_injection) =
+                    context_policy_initial_context_injection.take()
+                else {
+                    return Err(CodexErr::Io(std::io::Error::other(
+                        "controlled policy attempted more than one compaction per sampling invocation",
+                    )));
+                };
+                run_auto_compact(
+                    &sess,
+                    Arc::clone(&step_context),
+                    /*fallback_step_context*/ None,
+                    client_session,
+                    initial_context_injection,
+                    CompactionReason::ContextLimit,
+                    CompactionPhase::MidTurn,
+                )
+                .await?;
+                let mut post_compact_input = sess
+                    .clone_history()
+                    .await
+                    .for_prompt(&step_context.settings.model_info.input_modalities);
+                if let Some(executed_tool_calls) = sess.services.executed_tool_calls.as_ref()
+                    && executed_tool_calls.attach_pending_to_prompt(
+                        &mut post_compact_input,
+                        &mut executed_tool_calls_by_output,
+                    )
+                {
+                    codex_protocol::models::bound_executed_tool_calls_for_prompt(
+                        &mut post_compact_input,
+                    );
+                }
+                prompt = build_prompt(
+                    post_compact_input,
+                    step_context.as_ref(),
+                    base_instructions.clone(),
+                );
+            }
+            let model_visible_request = client_session.model_visible_context_snapshot(
+                &prompt,
+                &step_context.settings.model_info,
+                responses_metadata,
+            )?;
+            let observation = ContextPolicyObservation::new(
+                &prompt,
+                model_visible_request,
+                &step_context.settings.model_info,
+                &thread_id,
+                &turn_context.sub_id,
+                &turn_context.config.model_provider_id,
+            );
+            context_policy
+                .record_ready_to_invoke(decision, observation)
+                .await?;
+        }
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),

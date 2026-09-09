@@ -1,5 +1,8 @@
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_config::types::ContextPolicyConfig;
+use codex_config::types::ContextPolicyMode;
+use codex_config::types::ExternalContextPolicyStub;
 use codex_core::TurnInputRequest;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::compact::SUMMARY_PREFIX;
@@ -191,6 +194,39 @@ fn read_hook_inputs(path: &Path) -> Vec<Value> {
     text.lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("failed to parse hook input log line"))
+        .collect()
+}
+
+fn controlled_policy_config(
+    mode: ContextPolicyMode,
+    raw_log_path: AbsolutePathBuf,
+) -> ContextPolicyConfig {
+    ContextPolicyConfig {
+        mode,
+        fixed_threshold_tokens: (mode == ContextPolicyMode::ControlledFixed).then_some(1),
+        external_stub: (mode == ContextPolicyMode::ExternalStub)
+            .then_some(ExternalContextPolicyStub::AlwaysKeep),
+        external_stub_compact_at_epoch: None,
+        run_id: Some("phase8a-test-run".to_string()),
+        task_id: Some("phase8a-test-task".to_string()),
+        replicate_id: Some(0),
+        raw_log_path: Some(raw_log_path),
+    }
+}
+
+fn controlled_compact_at_epoch_zero(raw_log_path: AbsolutePathBuf) -> ContextPolicyConfig {
+    ContextPolicyConfig {
+        external_stub: Some(ExternalContextPolicyStub::CompactAtEpoch),
+        external_stub_compact_at_epoch: Some(0),
+        ..controlled_policy_config(ContextPolicyMode::ExternalStub, raw_log_path)
+    }
+}
+
+fn read_policy_records(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .expect("read context-policy log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse context-policy JSONL"))
         .collect()
 }
 
@@ -1814,6 +1850,262 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     assert_eq!(requests_payloads.len(), 7);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controlled_policy_decides_once_before_each_tool_follow_up_invocation() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let context_window = 100;
+    let second_call_id = "dummy-call-2";
+    let first_turn = sse(vec![
+        ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
+        ev_function_call(second_call_id, DUMMY_FUNCTION_NAME, "{}"),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 96),
+    ]);
+    let follow_up = sse(vec![
+        ev_assistant_message("m2", FINAL_REPLY),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 10),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![first_turn, follow_up]).await;
+
+    let policy_dir = TempDir::new().expect("create policy log directory");
+    let policy_path = policy_dir.path().join("tool-follow-up.jsonl");
+    let policy_path_absolute = AbsolutePathBuf::from_absolute_path(&policy_path)
+        .expect("policy log path should be absolute");
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config.model_context_window = Some(context_window);
+        config.model_auto_compact_token_limit = Some(90);
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        config.experimental_context_policy =
+            controlled_policy_config(ContextPolicyMode::ExternalStub, policy_path_absolute);
+    });
+    let codex = builder
+        .build(&server)
+        .await
+        .expect("build test codex")
+        .codex;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: FUNCTION_CALL_LIMIT_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit user turn");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "controlled mode must gate native mid-turn context-limit compaction"
+    );
+    assert!(
+        !requests.iter().any(|request| body_contains_text(
+            &request.body_json().to_string(),
+            SUMMARIZATION_PROMPT
+        )),
+        "always-KEEP must not issue a hidden summary request"
+    );
+
+    let records = read_policy_records(&policy_path);
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[0]["event"], "decision");
+    assert_eq!(records[0]["epoch"], 0);
+    assert_eq!(records[1]["event"], "ready_to_invoke");
+    assert_eq!(records[1]["epoch"], 0);
+    assert_eq!(records[2]["event"], "decision");
+    assert_eq!(records[2]["epoch"], 1);
+    assert_eq!(records[3]["event"], "ready_to_invoke");
+    assert_eq!(records[3]["epoch"], 1);
+    assert_eq!(records[0]["action"], "KEEP");
+    assert_eq!(records[2]["action"], "KEEP");
+    assert_eq!(
+        records[1]["model_visible_request"]["input"],
+        requests[0].body_json()["input"],
+        "ready evidence for epoch zero must match the request that was served"
+    );
+    assert_eq!(
+        records[3]["model_visible_request"]["input"],
+        requests[1].body_json()["input"],
+        "ready evidence for the tool follow-up must match the request that was served"
+    );
+    assert!(
+        records[2]["model_visible_request"]["input"]
+            .to_string()
+            .contains(DUMMY_CALL_ID),
+        "the second decision snapshot must include the first tool result"
+    );
+    assert!(
+        records[2]["model_visible_request"]["input"]
+            .to_string()
+            .contains(second_call_id),
+        "the second decision snapshot must include the second tool result"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controlled_policy_gates_native_pre_turn_context_limit_compaction() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let first_turn = sse(vec![
+        ev_assistant_message("m1", FIRST_REPLY),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 96),
+    ]);
+    let second_turn = sse(vec![
+        ev_assistant_message("m2", FINAL_REPLY),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 10),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![first_turn, second_turn]).await;
+
+    let policy_dir = TempDir::new().expect("create policy log directory");
+    let policy_path = policy_dir.path().join("pre-turn.jsonl");
+    let policy_path_absolute = AbsolutePathBuf::from_absolute_path(&policy_path)
+        .expect("policy log path should be absolute");
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config.model_context_window = Some(100);
+        config.model_auto_compact_token_limit = Some(90);
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        config.experimental_context_policy =
+            controlled_policy_config(ContextPolicyMode::ExternalStub, policy_path_absolute);
+    });
+    let test = builder.build(&server).await.expect("build test codex");
+
+    test.submit_text_turn("first controlled turn")
+        .await
+        .expect("submit first turn");
+    test.submit_text_turn("second controlled turn")
+        .await
+        .expect("submit second turn");
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "controlled mode must gate native pre-turn context-limit compaction"
+    );
+    assert!(
+        !requests.iter().any(|request| body_contains_text(
+            &request.body_json().to_string(),
+            SUMMARIZATION_PROMPT
+        )),
+        "always-KEEP must not issue a hidden pre-turn summary request"
+    );
+    let records = read_policy_records(&policy_path);
+    let decisions = records
+        .iter()
+        .filter(|record| record["event"] == "decision")
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions[0]["epoch"], 0);
+    assert_eq!(decisions[1]["epoch"], 1);
+    assert!(decisions.iter().all(|record| record["action"] == "KEEP"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controlled_fixed_and_external_stub_use_the_native_compactor_and_rebuild_context() {
+    skip_if_no_network!();
+
+    for mode in [
+        ContextPolicyMode::ControlledFixed,
+        ContextPolicyMode::ExternalStub,
+    ] {
+        let server = start_mock_server().await;
+        let summary = format!("{SUMMARY_TEXT}-{mode:?}");
+        let compact_turn = sse(vec![
+            ev_assistant_message("m1", &summary),
+            ev_completed_with_tokens("r1", /*total_tokens*/ 10),
+        ]);
+        let serve_turn = sse(vec![
+            ev_assistant_message("m2", FINAL_REPLY),
+            ev_completed_with_tokens("r2", /*total_tokens*/ 10),
+        ]);
+        let request_log = mount_sse_sequence(&server, vec![compact_turn, serve_turn]).await;
+
+        let policy_dir = TempDir::new().expect("create policy log directory");
+        let policy_path = policy_dir.path().join(format!("{mode:?}.jsonl"));
+        let policy_path_absolute = AbsolutePathBuf::from_absolute_path(&policy_path)
+            .expect("policy log path should be absolute");
+        let model_provider = non_openai_model_provider(&server);
+        let mut builder = test_codex().with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config
+                .features
+                .disable(Feature::TokenBudget)
+                .expect("disable TokenBudget");
+            config.experimental_context_policy = match mode {
+                ContextPolicyMode::ControlledFixed => {
+                    controlled_policy_config(mode, policy_path_absolute)
+                }
+                ContextPolicyMode::ExternalStub => {
+                    controlled_compact_at_epoch_zero(policy_path_absolute)
+                }
+                ContextPolicyMode::NativeFixed => unreachable!(),
+            };
+        });
+        let codex = builder
+            .build(&server)
+            .await
+            .expect("build test codex")
+            .codex;
+
+        codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "controlled compact input".into(),
+                text_elements: Vec::new(),
+            }]))
+            .await
+            .expect("submit user turn");
+        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+        let requests = request_log.requests();
+        assert_eq!(requests.len(), 2, "{mode:?} should compact then serve");
+        assert!(
+            body_contains_text(&requests[0].body_json().to_string(), SUMMARIZATION_PROMPT),
+            "{mode:?} should invoke the existing traditional summary request"
+        );
+        assert!(
+            requests[1].body_json().to_string().contains(&summary),
+            "{mode:?} should rebuild the serving context from the native compactor output"
+        );
+        assert!(
+            !body_contains_text(&requests[1].body_json().to_string(), SUMMARIZATION_PROMPT),
+            "the normal serving request must not retain the compaction trigger"
+        );
+
+        let records = read_policy_records(&policy_path);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["event"], "decision");
+        assert_eq!(records[0]["action"], "COMPACT");
+        assert_eq!(records[0]["compaction_reason"], "context_limit");
+        assert_eq!(records[1]["event"], "ready_to_invoke");
+        assert_eq!(records[1]["action"], "COMPACT");
+        assert_eq!(
+            records[1]["model_visible_request"]["input"],
+            requests[1].body_json()["input"],
+            "ready evidence must match the rebuilt request that was served"
+        );
+        assert!(
+            records[1]["model_visible_request"]["input"]
+                .to_string()
+                .contains(&summary),
+            "ready-to-invoke evidence must contain the rebuilt context"
+        );
+    }
+}
+
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
 #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
@@ -2305,6 +2597,10 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
     )
     .await;
 
+    let policy_dir = TempDir::new().expect("create policy log directory");
+    let policy_path = policy_dir.path().join("model-downshift.jsonl");
+    let policy_path_absolute = AbsolutePathBuf::from_absolute_path(&policy_path)
+        .expect("policy log path should be absolute");
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
@@ -2313,6 +2609,12 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
             config.update_plan_enabled = true;
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
+            config
+                .features
+                .disable(Feature::TokenBudget)
+                .expect("disable TokenBudget");
+            config.experimental_context_policy =
+                controlled_policy_config(ContextPolicyMode::ExternalStub, policy_path_absolute);
         });
     let test = builder.build(&server).await.expect("build test codex");
 
@@ -2352,6 +2654,21 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
         &requests[2].body_json(),
         previous_model,
         next_model,
+    );
+    let policy_records = read_policy_records(&policy_path);
+    assert_eq!(
+        policy_records
+            .iter()
+            .filter(|record| record["event"] == "decision")
+            .count(),
+        2
+    );
+    assert!(
+        policy_records
+            .iter()
+            .filter(|record| record["event"] == "decision")
+            .all(|record| record["action"] == "KEEP"),
+        "ModelDownshift compaction must bypass the research action"
     );
 
     insta::assert_snapshot!(
@@ -2408,6 +2725,10 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
     )
     .await;
 
+    let policy_dir = TempDir::new().expect("create policy log directory");
+    let policy_path = policy_dir.path().join("comp-hash-change.jsonl");
+    let policy_path_absolute = AbsolutePathBuf::from_absolute_path(&policy_path)
+        .expect("policy log path should be absolute");
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
@@ -2415,6 +2736,12 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
         .with_config(move |config| {
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
+            config
+                .features
+                .disable(Feature::TokenBudget)
+                .expect("disable TokenBudget");
+            config.experimental_context_policy =
+                controlled_policy_config(ContextPolicyMode::ExternalStub, policy_path_absolute);
         });
     let test = builder.build(&server).await.expect("build test codex");
 
@@ -2454,6 +2781,21 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
         &requests[2].body_json(),
         previous_model,
         next_model,
+    );
+    let policy_records = read_policy_records(&policy_path);
+    assert_eq!(
+        policy_records
+            .iter()
+            .filter(|record| record["event"] == "decision")
+            .count(),
+        2
+    );
+    assert!(
+        policy_records
+            .iter()
+            .filter(|record| record["event"] == "decision")
+            .all(|record| record["action"] == "KEEP"),
+        "CompHashChanged compaction must bypass the research action"
     );
 }
 
