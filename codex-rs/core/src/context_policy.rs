@@ -4,6 +4,7 @@ use std::io;
 
 use codex_config::types::{ContextPolicyConfig, ContextPolicyMode, ExternalContextPolicyStub};
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::models::ResponseItem;
 use codex_utils_cache::sha1_digest;
 use codex_utils_string::approx_token_count;
 use serde_json::Value;
@@ -27,10 +28,11 @@ pub(crate) enum ContextPolicyAction {
     Compact,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContextPolicyDecision {
     pub(crate) epoch: u64,
-    pub(crate) action: ContextPolicyAction,
+    pub(crate) action: Option<ContextPolicyAction>,
+    decision_mode: String,
     pre_action_l: i64,
     predicted_post_compact_l: Option<i64>,
 }
@@ -178,7 +180,12 @@ pub(crate) struct ContextPolicySeam {
     bridge_initialized: bool,
     next_request_id: u64,
     previous_ready: Option<ContextPolicyObservation>,
+    last_observation: Option<ContextPolicyObservation>,
+    previous_epoch: Option<u64>,
     previous_action: Option<ContextPolicyAction>,
+    pending_output_tokens: i64,
+    pending_additional_tokens: i64,
+    interval_open: bool,
 }
 
 impl ContextPolicySeam {
@@ -190,12 +197,67 @@ impl ContextPolicySeam {
             bridge_initialized: false,
             next_request_id: 0,
             previous_ready: None,
+            last_observation: None,
+            previous_epoch: None,
             previous_action: None,
+            pending_output_tokens: 0,
+            pending_additional_tokens: 0,
+            interval_open: false,
         }
     }
 
     pub(crate) fn is_controlled(&self) -> bool {
         self.config.mode != ContextPolicyMode::NativeFixed
+    }
+
+    /// Accumulate only model-visible output from a normal serving response.
+    /// Compaction-summary streams use a separate path and never call this method.
+    pub(crate) fn note_normal_output(&mut self, item: &ResponseItem) {
+        let visible_assistant_output = matches!(
+            item,
+            ResponseItem::Message { role, .. } if role == "assistant"
+        ) || matches!(
+            item,
+            ResponseItem::FunctionCall { .. }
+                | ResponseItem::CustomToolCall { .. }
+                | ResponseItem::ToolSearchCall { .. }
+                | ResponseItem::LocalShellCall { .. }
+                | ResponseItem::WebSearchCall { .. }
+                | ResponseItem::ImageGenerationCall { .. }
+        );
+        if visible_assistant_output {
+            self.pending_output_tokens = self
+                .pending_output_tokens
+                .saturating_add(estimate_item_token_count(item));
+        }
+    }
+
+    /// Track non-model additions for final intervals that have no next request
+    /// from which to derive the residual. Ordinary continued transitions still
+    /// use consecutive formal-L measurements as the authoritative total.
+    pub(crate) fn note_additional_items(&mut self, items: &[ResponseItem]) {
+        if !self.interval_open {
+            return;
+        }
+        for item in items {
+            let additional = matches!(
+                item,
+                ResponseItem::Message { role, .. } if role != "assistant"
+            ) || matches!(
+                item,
+                ResponseItem::AgentMessage { .. }
+                    | ResponseItem::AdditionalTools { .. }
+                    | ResponseItem::FunctionCallOutput { .. }
+                    | ResponseItem::CustomToolCallOutput { .. }
+                    | ResponseItem::ToolSearchOutput { .. }
+                    | ResponseItem::ConfigurationUpdate { .. }
+            );
+            if additional {
+                self.pending_additional_tokens = self
+                    .pending_additional_tokens
+                    .saturating_add(estimate_item_token_count(item));
+            }
+        }
     }
 
     fn is_mpc(&self) -> bool {
@@ -211,28 +273,30 @@ impl ContextPolicySeam {
             return Ok(None);
         }
         let observation = observation.with_prefix(self.previous_ready.as_ref());
-        let (action, predicted) = match self.config.mode {
+        let (action, predicted, decision_mode) = match self.config.mode {
             ContextPolicyMode::NativeFixed => unreachable!(),
             ContextPolicyMode::ControlledFixed => (
-                if observation.estimated_input_tokens
+                Some(if observation.formal_input_tokens
                     >= self.config.fixed_threshold_tokens.unwrap_or(i64::MAX)
                 {
                     ContextPolicyAction::Compact
                 } else {
                     ContextPolicyAction::Keep
-                },
+                }),
                 None,
+                "fixed_threshold".to_string(),
             ),
             ContextPolicyMode::ExternalStub => (
-                match self.config.external_stub {
+                Some(match self.config.external_stub {
                     Some(ExternalContextPolicyStub::CompactAtEpoch)
                         if self.config.external_stub_compact_at_epoch == Some(epoch) =>
                     {
                         ContextPolicyAction::Compact
                     }
                     _ => ContextPolicyAction::Keep,
-                },
+                }),
                 None,
+                "external_stub".to_string(),
             ),
             ContextPolicyMode::MpcH1 | ContextPolicyMode::Mpc => {
                 self.initialize_bridge(epoch, &observation).await?;
@@ -257,25 +321,19 @@ impl ContextPolicySeam {
                 if response.get("type").and_then(Value::as_str) != Some("decision") {
                     return Err(infrastructure("expected decision response"));
                 }
-                let action = match response.get("action").and_then(Value::as_str) {
-                    Some("KEEP") => ContextPolicyAction::Keep,
-                    Some("COMPACT") => ContextPolicyAction::Compact,
-                    _ => return Err(infrastructure("invalid or emergency action")),
-                };
-                let predicted = response.get("predicted_post_compact_L").and_then(Value::as_i64);
-                if action == ContextPolicyAction::Compact && predicted.is_none() {
-                    return Err(infrastructure("COMPACT response lacks reset prediction"));
-                }
-                (action, predicted)
+                let (action, predicted, mode) = parse_bridge_decision(&response)?;
+                (action, predicted, mode)
             }
         };
         let decision = ContextPolicyDecision {
             epoch,
             action,
+            decision_mode,
             pre_action_l: observation.formal_input_tokens,
             predicted_post_compact_l: predicted,
         };
-        let record = self.record("decision", decision, &observation);
+        self.last_observation = Some(observation.clone());
+        let record = self.record("decision", &decision, &observation);
         self.append(&record).await?;
         Ok(Some(decision))
     }
@@ -286,7 +344,7 @@ impl ContextPolicySeam {
         observation: ContextPolicyObservation,
     ) -> io::Result<()> {
         let observation = observation.with_prefix(self.previous_ready.as_ref());
-        if self.is_mpc() && decision.action == ContextPolicyAction::Compact {
+        if self.is_mpc() && decision.action == Some(ContextPolicyAction::Compact) {
             let request = self.message(
                 "compact_feedback",
                 decision.epoch,
@@ -306,10 +364,14 @@ impl ContextPolicySeam {
                 return Err(infrastructure("compact feedback was not accepted"));
             }
         }
-        let record = self.record("ready_to_invoke", decision, &observation);
+        let record = self.record("ready_to_invoke", &decision, &observation);
         self.append(&record).await?;
         self.previous_ready = Some(observation);
-        self.previous_action = Some(decision.action);
+        self.previous_epoch = Some(decision.epoch);
+        self.previous_action = decision.action;
+        self.pending_output_tokens = 0;
+        self.pending_additional_tokens = 0;
+        self.interval_open = true;
         Ok(())
     }
 
@@ -318,10 +380,33 @@ impl ContextPolicySeam {
             return Ok(());
         }
         let observation = self
-            .previous_ready
+            .last_observation
             .clone()
-            .ok_or_else(|| infrastructure("terminal without prior invocation"))?;
-        let request = self.message("terminal", epoch, &observation, serde_json::json!({"reason": reason}));
+            .or_else(|| self.previous_ready.clone())
+            .ok_or_else(|| infrastructure("terminal without policy observation"))?;
+        let mut body = serde_json::json!({"reason": reason});
+        if self.interval_open {
+            let previous_action = match self.previous_action {
+                Some(ContextPolicyAction::Keep) => "KEEP",
+                Some(ContextPolicyAction::Compact) => "COMPACT",
+                None => return Err(infrastructure("terminal action is missing")),
+            };
+            body["final_interval"] = serde_json::json!({
+                "from_epoch": self.previous_epoch.ok_or_else(|| {
+                    infrastructure("terminal epoch is missing")
+                })?,
+                "previous_action": previous_action,
+                "output_tokens": self.pending_output_tokens,
+                "additional_tokens": self.pending_additional_tokens,
+                "measurement_kind": L_KIND,
+            });
+        }
+        let request = self.message(
+            "terminal",
+            epoch,
+            &observation,
+            body,
+        );
         let response = self.exchange(&request).await?;
         if response.get("type").and_then(Value::as_str) != Some("terminated") {
             return Err(infrastructure("terminal was not accepted"));
@@ -331,6 +416,9 @@ impl ContextPolicySeam {
         if response.get("type").and_then(Value::as_str) != Some("shutdown_complete") {
             return Err(infrastructure("shutdown was not accepted"));
         }
+        self.bridge_initialized = false;
+        self.bridge = None;
+        self.interval_open = false;
         Ok(())
     }
 
@@ -379,10 +467,23 @@ impl ContextPolicySeam {
         let from_epoch = epoch
             .checked_sub(1)
             .ok_or_else(|| infrastructure("prior request exists at epoch zero"))?;
-        let additional = current
+        let growth = current
             .formal_input_tokens
             .checked_sub(previous.formal_input_tokens)
             .ok_or_else(|| infrastructure("negative realized context growth"))?;
+        let tracked_growth = self
+            .pending_output_tokens
+            .checked_add(self.pending_additional_tokens)
+            .ok_or_else(|| infrastructure("realized interval token count overflow"))?;
+        if tracked_growth > growth {
+            return Err(infrastructure(
+                "tracked structured arrival exceeds formal context growth",
+            ));
+        }
+        let output = self.pending_output_tokens;
+        let additional = growth
+            .checked_sub(output)
+            .ok_or_else(|| infrastructure("negative additional context growth"))?;
         let action = match self.previous_action {
             Some(ContextPolicyAction::Keep) => "KEEP",
             Some(ContextPolicyAction::Compact) => "COMPACT",
@@ -394,13 +495,16 @@ impl ContextPolicySeam {
             current,
             serde_json::json!({"transition": {"from_epoch": from_epoch, "to_epoch": epoch,
                 "previous_action": action, "previous_post_action_length": previous.formal_input_tokens,
-                "current_pre_action_length": current.formal_input_tokens, "output_tokens": 0,
+                "current_pre_action_length": current.formal_input_tokens, "output_tokens": output,
                 "additional_tokens": additional, "continued": true, "measurement_kind": L_KIND}}),
         );
         let response = self.exchange(&request).await?;
         if response.get("type").and_then(Value::as_str) != Some("transition_observed") {
             return Err(infrastructure("transition was not accepted"));
         }
+        self.pending_output_tokens = 0;
+        self.pending_additional_tokens = 0;
+        self.interval_open = false;
         Ok(())
     }
 
@@ -430,13 +534,14 @@ impl ContextPolicySeam {
             .await
     }
 
-    fn record(&self, event: &str, decision: ContextPolicyDecision, observation: &ContextPolicyObservation) -> Value {
+    fn record(&self, event: &str, decision: &ContextPolicyDecision, observation: &ContextPolicyObservation) -> Value {
         serde_json::json!({"event": event,
             "protocol_version": if self.is_mpc() { PROTOCOL_VERSION } else { PHASE8A_PROTOCOL_VERSION },
             "run_id": self.run_id(), "task_id": self.task_id(), "replicate_id": self.replicate_id(),
             "thread_id": observation.thread_id, "turn_id": observation.turn_id, "epoch": decision.epoch,
             "policy_mode": self.config.mode, "action": decision.action,
-            "compaction_reason": (decision.action == ContextPolicyAction::Compact).then_some("context_limit"),
+            "decision_mode": decision.decision_mode,
+            "compaction_reason": (decision.action == Some(ContextPolicyAction::Compact)).then_some("context_limit"),
             "estimated_input_tokens": observation.estimated_input_tokens,
             "formal_input_tokens": observation.formal_input_tokens,
             "reusable_prefix_tokens": self.is_mpc().then_some(observation.reusable_prefix_tokens),
@@ -495,6 +600,29 @@ fn hex_sha1(bytes: &[u8]) -> String {
 
 fn infrastructure(message: impl Into<String>) -> io::Error {
     io::Error::other(format!("context policy infrastructure failure: {}", message.into()))
+}
+
+fn parse_bridge_decision(
+    response: &Value,
+) -> io::Result<(Option<ContextPolicyAction>, Option<i64>, String)> {
+    let mode = response
+        .get("decision_mode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| infrastructure("decision_mode is missing"))?
+        .to_string();
+    let action = match (mode.as_str(), response.get("action").and_then(Value::as_str)) {
+        ("emergency", None) => None,
+        (_, Some("KEEP")) => Some(ContextPolicyAction::Keep),
+        (_, Some("COMPACT")) => Some(ContextPolicyAction::Compact),
+        _ => return Err(infrastructure("invalid planner action")),
+    };
+    let predicted = response
+        .get("predicted_post_compact_L")
+        .and_then(Value::as_i64);
+    if action == Some(ContextPolicyAction::Compact) && predicted.is_none() {
+        return Err(infrastructure("COMPACT response lacks reset prediction"));
+    }
+    Ok((action, predicted, mode))
 }
 
 #[cfg(test)]

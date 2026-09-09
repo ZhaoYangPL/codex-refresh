@@ -11,6 +11,7 @@ use super::ContextPolicyAction;
 use super::ContextPolicyObservation;
 use super::ContextPolicySeam;
 use super::native_context_limit_enabled;
+use super::parse_bridge_decision;
 use super::validate_config;
 use crate::Prompt;
 
@@ -83,7 +84,7 @@ async fn fixed_and_external_stub_share_decision_and_recording_seam() {
             .await
             .expect("record decision")
             .expect("controlled decision");
-        assert_eq!(decision.action, ContextPolicyAction::Compact);
+        assert_eq!(decision.action, Some(ContextPolicyAction::Compact));
         seam.record_ready_to_invoke(decision, observation())
             .await
             .expect("record invocation");
@@ -100,6 +101,53 @@ async fn fixed_and_external_stub_share_decision_and_recording_seam() {
         assert_eq!(records[1]["event"], "ready_to_invoke");
         assert_eq!(records[1]["epoch"], 0);
     }
+}
+
+#[tokio::test]
+async fn controlled_fixed_uses_formal_l_not_the_coarse_diagnostic_estimate() {
+    let directory = tempfile::tempdir().expect("create temp dir");
+    let path = absolute(&directory.path().join("fixed-formal-l.jsonl"));
+    let mut config = controlled_config(ContextPolicyMode::ControlledFixed, path);
+    config.fixed_threshold_tokens = Some(50);
+    let mut seam = ContextPolicySeam::new(config);
+
+    let mut below = observation();
+    below.estimated_input_tokens = 500;
+    below.formal_input_tokens = 49;
+    assert_eq!(
+        seam.decide(0, below)
+            .await
+            .expect("fixed decision")
+            .expect("controlled decision")
+            .action,
+        Some(ContextPolicyAction::Keep)
+    );
+
+    let mut at_threshold = observation();
+    at_threshold.estimated_input_tokens = 1;
+    at_threshold.formal_input_tokens = 50;
+    assert_eq!(
+        seam.decide(1, at_threshold)
+            .await
+            .expect("fixed decision")
+            .expect("controlled decision")
+            .action,
+        Some(ContextPolicyAction::Compact)
+    );
+}
+
+#[test]
+fn planner_emergency_is_a_typed_actionless_decision() {
+    let response = serde_json::json!({
+        "decision_mode": "emergency",
+        "action": null,
+        "predicted_post_compact_L": null,
+    });
+    let (action, predicted, mode) =
+        parse_bridge_decision(&response).expect("valid planner emergency");
+    assert_eq!(action, None);
+    assert_eq!(predicted, None);
+    assert_eq!(mode, "emergency");
 }
 
 #[tokio::test]

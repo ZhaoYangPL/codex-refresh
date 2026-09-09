@@ -223,6 +223,75 @@ fn controlled_compact_at_epoch_zero(raw_log_path: AbsolutePathBuf) -> ContextPol
     }
 }
 
+fn persistent_bridge_fixture(
+    directory: &TempDir,
+    raw_log_path: AbsolutePathBuf,
+) -> (ContextPolicyConfig, PathBuf) {
+    let script_path = directory.path().join("persistent_bridge.py");
+    let protocol_log = directory.path().join("bridge-protocol.jsonl");
+    fs::write(
+        &script_path,
+        r#"import json
+import sys
+
+log_path = sys.argv[1]
+for line in sys.stdin:
+    request = json.loads(line)
+    with open(log_path, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"type": request["type"], "epoch": request["epoch"]}) + "\n")
+    response = {key: request[key] for key in (
+        "protocol_version", "request_id", "run_id", "task_id",
+        "replicate_id", "thread_id", "epoch")}
+    kind = request["type"]
+    if kind == "initialize":
+        response.update(type="initialized", controller_mode=request["controller_mode"])
+    elif kind == "decide":
+        response.update(type="decision", action="KEEP", decision_mode="monetary",
+                        q_keep=1.0, q_compact=2.0, predicted_post_compact_L=None)
+    elif kind == "observe_transition":
+        response.update(type="transition_observed")
+    elif kind == "terminal":
+        response.update(type="terminated")
+    elif kind == "shutdown":
+        response.update(type="shutdown_complete")
+    print(json.dumps(response, separators=(",", ":")), flush=True)
+    if kind == "shutdown":
+        break
+"#,
+    )
+    .expect("write persistent bridge fixture");
+    let candidates = if cfg!(windows) {
+        ["python", "python3"]
+    } else {
+        ["python3", "python"]
+    };
+    let python = candidates
+        .into_iter()
+        .find_map(|candidate| which::which(candidate).ok())
+        .expect("Phase 8B host bridge test requires Python");
+    let config = ContextPolicyConfig {
+        mode: ContextPolicyMode::MpcH1,
+        run_id: Some("phase8b-persistent-run".to_string()),
+        task_id: Some("phase8b-persistent-task".to_string()),
+        replicate_id: Some(0),
+        raw_log_path: Some(raw_log_path),
+        bridge_command: Some(
+            AbsolutePathBuf::from_absolute_path(&python).expect("Python path is absolute"),
+        ),
+        bridge_args: vec![
+            script_path.to_string_lossy().into_owned(),
+            protocol_log.to_string_lossy().into_owned(),
+        ],
+        bridge_timeout_ms: Some(2_000),
+        controller_config_id: Some("fixture-controller-v1".to_string()),
+        recovery_artifact_id: Some("fixture-recovery-v1".to_string()),
+        z_schema_version: Some("phase4-observable-v1".to_string()),
+        seed: Some(7),
+        ..Default::default()
+    };
+    (config, protocol_log)
+}
+
 fn read_policy_records(path: &Path) -> Vec<Value> {
     fs::read_to_string(path)
         .expect("read context-policy log")
@@ -1951,6 +2020,64 @@ async fn controlled_policy_decides_once_before_each_tool_follow_up_invocation() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controlled_policy_decides_once_across_a_stream_retry() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let incomplete = sse(vec![json!({"type": "response.output_item.done"})]);
+    let completed = sse(vec![
+        ev_assistant_message("m-retry", FINAL_REPLY),
+        ev_completed_with_tokens("r-retry", 10),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![incomplete, completed]).await;
+
+    let policy_dir = TempDir::new().expect("create policy log directory");
+    let policy_path = policy_dir.path().join("stream-retry.jsonl");
+    let policy_path_absolute = AbsolutePathBuf::from_absolute_path(&policy_path)
+        .expect("policy log path should be absolute");
+    let mut model_provider = non_openai_model_provider(&server);
+    model_provider.request_max_retries = Some(0);
+    model_provider.stream_max_retries = Some(1);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        config.experimental_context_policy =
+            controlled_policy_config(ContextPolicyMode::ExternalStub, policy_path_absolute);
+    });
+    let codex = builder.build(&server).await.expect("build test codex").codex;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "controlled retry".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit user turn");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    assert_eq!(request_log.requests().len(), 2, "one transport retry expected");
+    let records = read_policy_records(&policy_path);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["event"] == "decision")
+            .count(),
+        1,
+        "a transport retry must not create another logical decision",
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["event"] == "ready_to_invoke")
+            .count(),
+        1,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_results_survive_policy_compact_before_follow_up_invocation() {
     skip_if_no_network!();
 
@@ -2083,6 +2210,75 @@ async fn controlled_policy_gates_native_pre_turn_context_limit_compaction() {
     assert_eq!(decisions[0]["epoch"], 0);
     assert_eq!(decisions[1]["epoch"], 1);
     assert!(decisions.iter().all(|record| record["action"] == "KEEP"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mpc_bridge_and_estimator_trajectory_persist_across_host_turns() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("m-one", FIRST_REPLY),
+                ev_completed_with_tokens("r-one", 10),
+            ]),
+            sse(vec![
+                ev_assistant_message("m-two", FINAL_REPLY),
+                ev_completed_with_tokens("r-two", 10),
+            ]),
+        ],
+    )
+    .await;
+    let policy_dir = TempDir::new().expect("create policy fixture directory");
+    let raw_log_path = policy_dir.path().join("persistent-policy.jsonl");
+    let raw_log_path = AbsolutePathBuf::from_absolute_path(&raw_log_path)
+        .expect("policy log path should be absolute");
+    let (policy, protocol_log) = persistent_bridge_fixture(&policy_dir, raw_log_path);
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        config.experimental_context_policy = policy;
+    });
+    let test = builder.build(&server).await.expect("build test codex");
+
+    test.submit_text_turn("first MPC host turn")
+        .await
+        .expect("submit first turn");
+    test.submit_text_turn("second MPC host turn")
+        .await
+        .expect("submit second turn");
+    test.codex.submit(Op::Shutdown).await.expect("shutdown session");
+    wait_for_event(&test.codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+
+    assert_eq!(request_log.requests().len(), 2);
+    let protocol = fs::read_to_string(protocol_log).expect("read bridge protocol log");
+    let events = protocol
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("valid fixture record"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().expect("event type"))
+            .collect::<Vec<_>>(),
+        vec![
+            "initialize",
+            "decide",
+            "observe_transition",
+            "decide",
+            "terminal",
+            "shutdown",
+        ]
+    );
+    assert_eq!(events[1]["epoch"], 0);
+    assert_eq!(events[2]["epoch"], 1);
+    assert_eq!(events[3]["epoch"], 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
