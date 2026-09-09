@@ -32,6 +32,7 @@ fn controlled_config(
         task_id: Some("task-1".to_string()),
         replicate_id: Some(2),
         raw_log_path: Some(raw_log_path),
+        ..Default::default()
     }
 }
 

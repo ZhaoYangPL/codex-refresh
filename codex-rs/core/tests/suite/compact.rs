@@ -211,6 +211,7 @@ fn controlled_policy_config(
         task_id: Some("phase8a-test-task".to_string()),
         replicate_id: Some(0),
         raw_log_path: Some(raw_log_path),
+        ..Default::default()
     }
 }
 
@@ -1950,6 +1951,77 @@ async fn controlled_policy_decides_once_before_each_tool_follow_up_invocation() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_results_survive_policy_compact_before_follow_up_invocation() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let second_call_id = "phase8b-tool-call-2";
+    let first_turn = sse(vec![
+        ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
+        ev_function_call(second_call_id, DUMMY_FUNCTION_NAME, "{}"),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 40),
+    ]);
+    let compact_turn = sse(vec![
+        ev_assistant_message("m-summary", "summary retaining the completed tool work"),
+        ev_completed_with_tokens("r-summary", /*total_tokens*/ 10),
+    ]);
+    let follow_up = sse(vec![
+        ev_assistant_message("m-final", FINAL_REPLY),
+        ev_completed_with_tokens("r-final", /*total_tokens*/ 10),
+    ]);
+    let request_log =
+        mount_sse_sequence(&server, vec![first_turn, compact_turn, follow_up]).await;
+
+    let policy_dir = TempDir::new().expect("create policy log directory");
+    let policy_path = policy_dir.path().join("tool-compact-follow-up.jsonl");
+    let policy_path_absolute = AbsolutePathBuf::from_absolute_path(&policy_path)
+        .expect("policy log path should be absolute");
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        let mut policy =
+            controlled_policy_config(ContextPolicyMode::ExternalStub, policy_path_absolute);
+        policy.external_stub = Some(ExternalContextPolicyStub::CompactAtEpoch);
+        policy.external_stub_compact_at_epoch = Some(1);
+        config.experimental_context_policy = policy;
+    });
+    let codex = builder.build(&server).await.expect("build test codex").codex;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: FUNCTION_CALL_LIMIT_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit user turn");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3, "model, compact, and rebuilt serve expected");
+    assert!(body_contains_text(
+        &requests[1].body_json().to_string(),
+        SUMMARIZATION_PROMPT
+    ));
+    let rebuilt = requests[2].body_json()["input"].to_string();
+    assert!(rebuilt.contains(DUMMY_CALL_ID));
+    assert!(rebuilt.contains(second_call_id));
+    assert!(!body_contains_text(&rebuilt, SUMMARIZATION_PROMPT));
+
+    let records = read_policy_records(&policy_path);
+    let decisions = records
+        .iter()
+        .filter(|record| record["event"] == "decision")
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 2, "summary request is not a policy epoch");
+    assert_eq!(decisions[1]["action"], "COMPACT");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn controlled_policy_gates_native_pre_turn_context_limit_compaction() {
     skip_if_no_network!();
 
@@ -2052,7 +2124,9 @@ async fn controlled_fixed_and_external_stub_use_the_native_compactor_and_rebuild
                 ContextPolicyMode::ExternalStub => {
                     controlled_compact_at_epoch_zero(policy_path_absolute)
                 }
-                ContextPolicyMode::NativeFixed => unreachable!(),
+                ContextPolicyMode::NativeFixed
+                | ContextPolicyMode::MpcH1
+                | ContextPolicyMode::Mpc => unreachable!(),
             };
         });
         let codex = builder

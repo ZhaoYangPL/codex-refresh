@@ -71,6 +71,10 @@ pub enum ContextPolicyMode {
     ControlledFixed,
     /// Use a deterministic in-process stand-in for a future external policy bridge.
     ExternalStub,
+    /// Invoke the accepted controller through the Phase 8B bridge with H=1.
+    MpcH1,
+    /// Invoke the accepted controller through the Phase 8B bridge with frozen H>1.
+    Mpc,
 }
 
 /// Deterministic policy used to validate the external-policy side of the Phase 8A seam.
@@ -93,6 +97,14 @@ pub struct ContextPolicyConfig {
     pub task_id: Option<String>,
     pub replicate_id: Option<u64>,
     pub raw_log_path: Option<AbsolutePathBuf>,
+    pub bridge_command: Option<AbsolutePathBuf>,
+    pub bridge_args: Vec<String>,
+    pub bridge_working_directory: Option<AbsolutePathBuf>,
+    pub bridge_timeout_ms: Option<u64>,
+    pub controller_config_id: Option<String>,
+    pub recovery_artifact_id: Option<String>,
+    pub z_schema_version: Option<String>,
+    pub seed: Option<u64>,
 }
 
 impl Default for ContextPolicyConfig {
@@ -106,6 +118,14 @@ impl Default for ContextPolicyConfig {
             task_id: None,
             replicate_id: None,
             raw_log_path: None,
+            bridge_command: None,
+            bridge_args: Vec::new(),
+            bridge_working_directory: None,
+            bridge_timeout_ms: None,
+            controller_config_id: None,
+            recovery_artifact_id: None,
+            z_schema_version: None,
+            seed: None,
         }
     }
 }

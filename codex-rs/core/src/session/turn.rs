@@ -666,6 +666,13 @@ pub(crate) async fn run_turn(
         }
     }
 
+    context_policy
+        .terminal(
+            sess.next_context_policy_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "natural_complete",
+        )
+        .await?;
     Ok(last_agent_message)
 }
 
