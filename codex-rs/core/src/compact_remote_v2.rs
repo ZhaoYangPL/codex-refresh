@@ -259,8 +259,10 @@ async fn run_remote_compact_task_inner_impl(
     )
     .await?;
     let mut next_attempt_index = 0_u64;
+    // Same canonical provider namespace as `request_started`; see
+    // `request_ledger::attempt_identity`.
     let initial_identity = crate::request_ledger::attempt_identity(
-        turn_context.provider.info().name.as_str(),
+        turn_context.config.model_provider_id.as_str(),
         turn_context.model_info().slug.as_str(),
     );
 
@@ -301,8 +303,9 @@ async fn run_remote_compact_task_inner_impl(
             // The fallback attempt belongs to the same logical compaction
             // lifecycle but runs on another model/provider; keep its own
             // identity so accounting never attributes it to the initial model.
+            // The provider part stays in the configured-provider namespace.
             let fallback_identity = crate::request_ledger::attempt_identity(
-                fallback_turn_context.provider.info().name.as_str(),
+                fallback_turn_context.config.model_provider_id.as_str(),
                 fallback_turn_context.model_info().slug.as_str(),
             );
             if let (Some(ledger), Some(request)) =
@@ -369,9 +372,10 @@ async fn run_remote_compact_task_inner_impl(
     if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), raw_request.as_ref()) {
         let visible_output_tokens =
             crate::context_policy::visible_output_token_count(&compaction_output);
-        // Attribute the terminal attempt to whichever step context produced it.
+        // Attribute the terminal attempt to whichever step context produced it,
+        // using the canonical provider identifier shared with `request_started`.
         let terminal_identity = crate::request_ledger::attempt_identity(
-            compaction_turn_context.provider.info().name.as_str(),
+            compaction_turn_context.config.model_provider_id.as_str(),
             compaction_turn_context.model_info().slug.as_str(),
         );
         ledger
@@ -469,9 +473,13 @@ async fn run_remote_compaction_request_v2(
     let turn_context = &step_context.turn;
     // This attempt's own provider/model identity. It may differ from the logical
     // request identity when a fallback step context is used, so record it
-    // explicitly instead of relying on the request-level fields.
+    // explicitly instead of relying on the request-level fields.  The provider
+    // identifier is the configured provider key, never `provider.info().name`:
+    // the canonical accounting layer compares attempt identity against
+    // request identity, and a display name (`OpenAI` vs `openai`) would register
+    // as a provider fallback for a request that never changed provider.
     let identity = crate::request_ledger::attempt_identity(
-        turn_context.provider.info().name.as_str(),
+        turn_context.config.model_provider_id.as_str(),
         turn_context.model_info().slug.as_str(),
     );
     let max_retries = turn_context

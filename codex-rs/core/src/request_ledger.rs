@@ -72,6 +72,16 @@ pub(crate) struct AttemptIdentity {
 
 /// Build the attempt identity for a concrete provider/model pair.
 ///
+/// `provider_id` must come from the same namespace as the request-level
+/// `RequestDescriptor::provider_id`, i.e. the configured provider key
+/// (`config.model_provider_id`) rather than a provider's display/friendly name.
+/// The two are not interchangeable: a configured key may be `openai` while the
+/// display name is `OpenAI`, and the canonical accounting layer detects fallback
+/// by comparing attempt identity against request identity.  Mixing namespaces
+/// would report a provider fallback for a request that never changed provider.
+/// Use `model_id` from `model_info().slug`, which is already the same value the
+/// descriptor records.
+///
 /// Codex has no per-model pricing schedule mapping, so the schedule stays
 /// unknown here; the accounting layer resolves pricing from canonical config or
 /// fixture and fails closed rather than guessing when mixed-model evidence is
@@ -749,6 +759,86 @@ mod tests {
             .await
             .expect("next start");
         assert_eq!(next.request_index, 1);
+    }
+
+    #[tokio::test]
+    async fn attempt_identity_shares_the_request_provider_namespace() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("requests.raw.jsonl");
+        let ledger = RawRequestLedger::from_config(&config(&path))
+            .expect("ledger")
+            .expect("enabled");
+        let request = ledger.begin_request(descriptor()).await.expect("start");
+        // `descriptor()` models the configured provider key (`openai`), which is
+        // what `config.model_provider_id` supplies at every call site.
+        let same_provider = attempt_identity("fixture-provider", "fixture-model");
+        ledger
+            .attempt_started(&request, 0, Some(&same_provider))
+            .await
+            .expect("attempt");
+        ledger
+            .attempt_failed(&request, 0, "provider_context_rejection", "overflow", None)
+            .await
+            .expect("failure");
+        // A fallback model on the *same* configured provider: the provider value
+        // is byte-identical to the request's, so the accounting layer sees a
+        // model fallback and not a provider fallback.
+        let same_provider_other_model = attempt_identity("fixture-provider", "fixture-model-mini");
+        ledger
+            .attempt_started(&request, 1, Some(&same_provider_other_model))
+            .await
+            .expect("fallback attempt");
+        ledger
+            .retry_scheduled(&request, 1, 0.0)
+            .await
+            .expect("retry");
+        // A genuine provider fallback does change the value.
+        let other_provider = attempt_identity("fallback-provider", "fallback-model");
+        ledger
+            .attempt_started(&request, 2, Some(&other_provider))
+            .await
+            .expect("provider fallback attempt");
+        ledger
+            .completed(
+                &request,
+                None,
+                None,
+                Some(1),
+                "completed",
+                Some(&other_provider),
+            )
+            .await
+            .expect("complete");
+        let rows = std::fs::read_to_string(&path)
+            .expect("read")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("json"))
+            .collect::<Vec<_>>();
+        let request_provider = rows[0]["provider_id"].as_str().expect("provider_id");
+        assert_eq!(request_provider, "fixture-provider");
+        // Every attempt-level provider value lives in that same namespace, so a
+        // plain string comparison against `provider_id` is meaningful.
+        let attempt_providers = rows
+            .iter()
+            .filter_map(|row| row.get("attempt_provider_id").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attempt_providers,
+            [
+                "fixture-provider",
+                "fixture-provider",
+                "fallback-provider",
+                "fallback-provider",
+            ]
+        );
+        // Same configured provider: only the model differs.
+        assert_eq!(rows[1]["attempt_provider_id"], request_provider);
+        assert_eq!(rows[1]["attempt_model_id"], rows[0]["model_id"]);
+        assert_eq!(rows[3]["attempt_provider_id"], request_provider);
+        assert_ne!(rows[3]["attempt_model_id"], rows[0]["model_id"]);
+        // Different configured provider: both differ.
+        assert_ne!(rows[5]["attempt_provider_id"], request_provider);
+        assert_ne!(rows[5]["attempt_model_id"], rows[0]["model_id"]);
     }
 
     #[test]

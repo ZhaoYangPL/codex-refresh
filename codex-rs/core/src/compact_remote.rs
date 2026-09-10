@@ -264,9 +264,12 @@ async fn run_remote_compact_task_inner_impl(
             let fallback_turn_context = &fallback_step_context.turn;
             // The retry runs on another model/provider but stays inside the same
             // logical compaction lifecycle; record the attempt's own identity so
-            // accounting never attributes it to the original model.
+            // accounting never attributes it to the original model.  The provider
+            // identifier must come from the same namespace as the request-level
+            // one (`config.model_provider_id`), otherwise an ordinary
+            // same-provider request looks like a provider fallback.
             let fallback_identity = crate::request_ledger::attempt_identity(
-                fallback_turn_context.provider.info().name.as_str(),
+                fallback_turn_context.config.model_provider_id.as_str(),
                 fallback_turn_context.model_info().slug.as_str(),
             );
             if let (Some(ledger), Some(request)) =
@@ -330,9 +333,10 @@ async fn run_remote_compact_task_inner_impl(
             .map(crate::context_policy::visible_output_token_count)
             .sum();
         // The terminal attempt may have been the fallback one; attribute it to
-        // whichever turn context actually produced the compacted history.
+        // whichever turn context actually produced the compacted history, using
+        // the canonical provider identifier shared with `request_started`.
         let terminal_identity = crate::request_ledger::attempt_identity(
-            compaction_turn_context.provider.info().name.as_str(),
+            compaction_turn_context.config.model_provider_id.as_str(),
             compaction_turn_context.model_info().slug.as_str(),
         );
         ledger
