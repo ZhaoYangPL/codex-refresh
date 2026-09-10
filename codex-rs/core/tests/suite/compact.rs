@@ -1,5 +1,8 @@
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_config::types::ContextPolicyConfig;
+use codex_config::types::ContextPolicyMode;
+use codex_config::types::ExternalContextPolicyStub;
 use codex_core::TurnInputRequest;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::compact::SUMMARY_PREFIX;
@@ -191,6 +194,125 @@ fn read_hook_inputs(path: &Path) -> Vec<Value> {
     text.lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("failed to parse hook input log line"))
+        .collect()
+}
+
+fn controlled_policy_config(
+    mode: ContextPolicyMode,
+    raw_log_path: AbsolutePathBuf,
+) -> ContextPolicyConfig {
+    ContextPolicyConfig {
+        mode,
+        fixed_threshold_tokens: (mode == ContextPolicyMode::ControlledFixed).then_some(1),
+        external_stub: (mode == ContextPolicyMode::ExternalStub)
+            .then_some(ExternalContextPolicyStub::AlwaysKeep),
+        external_stub_compact_at_epoch: None,
+        run_id: Some("phase8a-test-run".to_string()),
+        task_id: Some("phase8a-test-task".to_string()),
+        replicate_id: Some(0),
+        raw_log_path: Some(raw_log_path),
+        ..Default::default()
+    }
+}
+
+fn controlled_compact_at_epoch_zero(raw_log_path: AbsolutePathBuf) -> ContextPolicyConfig {
+    ContextPolicyConfig {
+        external_stub: Some(ExternalContextPolicyStub::CompactAtEpoch),
+        external_stub_compact_at_epoch: Some(0),
+        ..controlled_policy_config(ContextPolicyMode::ExternalStub, raw_log_path)
+    }
+}
+
+fn persistent_bridge_fixture(
+    directory: &TempDir,
+    raw_log_path: AbsolutePathBuf,
+    behavior: &str,
+) -> (ContextPolicyConfig, PathBuf) {
+    let script_path = directory.path().join("persistent_bridge.py");
+    let protocol_log = directory.path().join("bridge-protocol.jsonl");
+    fs::write(
+        &script_path,
+        r#"import json
+import sys
+
+log_path = sys.argv[1]
+behavior = sys.argv[2]
+for line in sys.stdin:
+    request = json.loads(line)
+    with open(log_path, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"type": request["type"], "epoch": request["epoch"],
+                                 "reason": request.get("reason")}) + "\n")
+    response = {key: request[key] for key in (
+        "protocol_version", "request_id", "run_id", "task_id",
+        "replicate_id", "thread_id", "epoch")}
+    kind = request["type"]
+    if kind == "initialize":
+        response.update(type="initialized", controller_mode=request["controller_mode"])
+    elif kind == "decide":
+        if behavior == "emergency_after_first" and request["epoch"] > 0:
+            response.update(type="decision", action=None, decision_mode="emergency",
+                            q_keep=None, q_compact=None, predicted_post_compact_L=None)
+        else:
+            response.update(type="decision", action="KEEP", decision_mode="monetary",
+                            q_keep=1.0, q_compact=2.0, predicted_post_compact_L=None)
+    elif kind == "observe_transition":
+        response.update(type="transition_observed")
+    elif kind == "terminal":
+        response.update(type="unexpected" if behavior == "terminal_failure" else "terminated")
+    elif kind == "shutdown":
+        response.update(type="shutdown_complete")
+    print(json.dumps(response, separators=(",", ":")), flush=True)
+    if kind == "shutdown":
+        break
+"#,
+    )
+    .expect("write persistent bridge fixture");
+    let candidates = if cfg!(windows) {
+        ["python", "python3"]
+    } else {
+        ["python3", "python"]
+    };
+    let python = candidates
+        .into_iter()
+        .find_map(|candidate| which::which(candidate).ok())
+        .expect("Phase 8B host bridge test requires Python");
+    let config = ContextPolicyConfig {
+        mode: ContextPolicyMode::MpcH1,
+        run_id: Some("phase8b-persistent-run".to_string()),
+        task_id: Some("phase8b-persistent-task".to_string()),
+        replicate_id: Some(0),
+        raw_log_path: Some(raw_log_path),
+        bridge_command: Some(
+            AbsolutePathBuf::from_absolute_path(&python).expect("Python path is absolute"),
+        ),
+        bridge_args: vec![
+            script_path.to_string_lossy().into_owned(),
+            protocol_log.to_string_lossy().into_owned(),
+            behavior.to_string(),
+        ],
+        bridge_timeout_ms: Some(2_000),
+        controller_config_id: Some("fixture-controller-v1".to_string()),
+        recovery_artifact_id: Some("fixture-recovery-v1".to_string()),
+        z_schema_version: Some("phase4-observable-v1".to_string()),
+        seed: Some(7),
+        ..Default::default()
+    };
+    (config, protocol_log)
+}
+
+fn read_policy_records(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .expect("read context-policy log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse context-policy JSONL"))
+        .collect()
+}
+
+fn read_request_records(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .expect("read raw request ledger")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse raw request JSONL"))
         .collect()
 }
 
@@ -1814,6 +1936,681 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     assert_eq!(requests_payloads.len(), 7);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controlled_policy_decides_once_before_each_tool_follow_up_invocation() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let context_window = 100;
+    let second_call_id = "dummy-call-2";
+    let first_turn = sse(vec![
+        ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
+        ev_function_call(second_call_id, DUMMY_FUNCTION_NAME, "{}"),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 96),
+    ]);
+    let follow_up = sse(vec![
+        ev_assistant_message("m2", FINAL_REPLY),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 10),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![first_turn, follow_up]).await;
+
+    let policy_dir = TempDir::new().expect("create policy log directory");
+    let policy_path = policy_dir.path().join("tool-follow-up.jsonl");
+    let policy_path_absolute = AbsolutePathBuf::from_absolute_path(&policy_path)
+        .expect("policy log path should be absolute");
+    let request_path = policy_dir.path().join("tool-follow-up-requests.jsonl");
+    let request_path_absolute = AbsolutePathBuf::from_absolute_path(&request_path)
+        .expect("request log path should be absolute");
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config.model_context_window = Some(context_window);
+        config.model_auto_compact_token_limit = Some(90);
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        let mut policy =
+            controlled_policy_config(ContextPolicyMode::ExternalStub, policy_path_absolute);
+        policy.request_raw_log_path = Some(request_path_absolute);
+        policy.pricing_schedule_id = Some("fixture-price-v1".to_string());
+        config.experimental_context_policy = policy;
+    });
+    let codex = builder
+        .build(&server)
+        .await
+        .expect("build test codex")
+        .codex;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: FUNCTION_CALL_LIMIT_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit user turn");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "controlled mode must gate native mid-turn context-limit compaction"
+    );
+    assert!(
+        !requests.iter().any(|request| body_contains_text(
+            &request.body_json().to_string(),
+            SUMMARIZATION_PROMPT
+        )),
+        "always-KEEP must not issue a hidden summary request"
+    );
+
+    let records = read_policy_records(&policy_path);
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[0]["event"], "decision");
+    assert_eq!(records[0]["epoch"], 0);
+    assert_eq!(records[1]["event"], "ready_to_invoke");
+    assert_eq!(records[1]["epoch"], 0);
+    assert_eq!(records[2]["event"], "decision");
+    assert_eq!(records[2]["epoch"], 1);
+    assert_eq!(records[3]["event"], "ready_to_invoke");
+    assert_eq!(records[3]["epoch"], 1);
+    assert_eq!(records[0]["action"], "KEEP");
+    assert_eq!(records[2]["action"], "KEEP");
+    assert_eq!(
+        records[1]["model_visible_request"]["input"],
+        requests[0].body_json()["input"],
+        "ready evidence for epoch zero must match the request that was served"
+    );
+    assert_eq!(
+        records[3]["model_visible_request"]["input"],
+        requests[1].body_json()["input"],
+        "ready evidence for the tool follow-up must match the request that was served"
+    );
+    assert!(
+        records[2]["model_visible_request"]["input"]
+            .to_string()
+            .contains(DUMMY_CALL_ID),
+        "the second decision snapshot must include the first tool result"
+    );
+    assert!(
+        records[2]["model_visible_request"]["input"]
+            .to_string()
+            .contains(second_call_id),
+        "the second decision snapshot must include the second tool result"
+    );
+    let request_records = read_request_records(&request_path);
+    assert_eq!(
+        request_records
+            .iter()
+            .filter(|record| record["event"] == "request_started")
+            .count(),
+        2,
+        "tool events must not fabricate provider requests"
+    );
+    assert!(
+        request_records
+            .iter()
+            .all(|record| record["request_purpose"] == "serve")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controlled_policy_decides_once_across_a_stream_retry() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let incomplete = sse(vec![json!({"type": "response.output_item.done"})]);
+    let completed = sse(vec![
+        ev_assistant_message("m-retry", FINAL_REPLY),
+        ev_completed_with_tokens("r-retry", 10),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![incomplete, completed]).await;
+
+    let policy_dir = TempDir::new().expect("create policy log directory");
+    let policy_path = policy_dir.path().join("stream-retry.jsonl");
+    let policy_path_absolute = AbsolutePathBuf::from_absolute_path(&policy_path)
+        .expect("policy log path should be absolute");
+    let request_path = policy_dir.path().join("stream-retry-requests.jsonl");
+    let request_path_absolute = AbsolutePathBuf::from_absolute_path(&request_path)
+        .expect("request log path should be absolute");
+    let mut model_provider = non_openai_model_provider(&server);
+    model_provider.request_max_retries = Some(0);
+    model_provider.stream_max_retries = Some(1);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        let mut policy =
+            controlled_policy_config(ContextPolicyMode::ExternalStub, policy_path_absolute);
+        policy.request_raw_log_path = Some(request_path_absolute);
+        config.experimental_context_policy = policy;
+    });
+    let codex = builder
+        .build(&server)
+        .await
+        .expect("build test codex")
+        .codex;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "controlled retry".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit user turn");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    assert_eq!(
+        request_log.requests().len(),
+        2,
+        "one transport retry expected"
+    );
+    let records = read_policy_records(&policy_path);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["event"] == "decision")
+            .count(),
+        1,
+        "a transport retry must not create another logical decision",
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["event"] == "ready_to_invoke")
+            .count(),
+        1,
+    );
+    let request_records = read_request_records(&request_path);
+    let logical_ids = request_records
+        .iter()
+        .map(|record| record["logical_request_id"].as_str().expect("logical id"))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(logical_ids.len(), 1, "retry must stay one logical request");
+    assert_eq!(
+        request_records
+            .iter()
+            .filter(|record| record["event"] == "attempt_started")
+            .count(),
+        2
+    );
+    assert_eq!(
+        request_records
+            .iter()
+            .filter(|record| record["event"] == "retry_scheduled")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_results_survive_policy_compact_before_follow_up_invocation() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let second_call_id = "phase8b-tool-call-2";
+    let first_turn = sse(vec![
+        ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
+        ev_function_call(second_call_id, DUMMY_FUNCTION_NAME, "{}"),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 40),
+    ]);
+    let compact_turn = sse(vec![
+        ev_assistant_message("m-summary", "summary retaining the completed tool work"),
+        ev_completed_with_tokens("r-summary", /*total_tokens*/ 10),
+    ]);
+    let follow_up = sse(vec![
+        ev_assistant_message("m-final", FINAL_REPLY),
+        ev_completed_with_tokens("r-final", /*total_tokens*/ 10),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![first_turn, compact_turn, follow_up]).await;
+
+    let policy_dir = TempDir::new().expect("create policy log directory");
+    let policy_path = policy_dir.path().join("tool-compact-follow-up.jsonl");
+    let policy_path_absolute = AbsolutePathBuf::from_absolute_path(&policy_path)
+        .expect("policy log path should be absolute");
+    let request_path = policy_dir
+        .path()
+        .join("tool-compact-follow-up-requests.jsonl");
+    let request_path_absolute = AbsolutePathBuf::from_absolute_path(&request_path)
+        .expect("request log path should be absolute");
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        let mut policy =
+            controlled_policy_config(ContextPolicyMode::ExternalStub, policy_path_absolute);
+        policy.external_stub = Some(ExternalContextPolicyStub::CompactAtEpoch);
+        policy.external_stub_compact_at_epoch = Some(1);
+        policy.request_raw_log_path = Some(request_path_absolute);
+        config.experimental_context_policy = policy;
+    });
+    let codex = builder
+        .build(&server)
+        .await
+        .expect("build test codex")
+        .codex;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: FUNCTION_CALL_LIMIT_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit user turn");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "model, compact, and rebuilt serve expected"
+    );
+    assert!(body_contains_text(
+        &requests[1].body_json().to_string(),
+        SUMMARIZATION_PROMPT
+    ));
+    let rebuilt = requests[2].body_json()["input"].to_string();
+    assert!(rebuilt.contains(DUMMY_CALL_ID));
+    assert!(rebuilt.contains(second_call_id));
+    assert!(!body_contains_text(&rebuilt, SUMMARIZATION_PROMPT));
+
+    let records = read_policy_records(&policy_path);
+    let decisions = records
+        .iter()
+        .filter(|record| record["event"] == "decision")
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 2, "summary request is not a policy epoch");
+    assert_eq!(decisions[1]["action"], "COMPACT");
+    let starts = read_request_records(&request_path)
+        .into_iter()
+        .filter(|record| record["event"] == "request_started")
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 3);
+    assert_eq!(
+        starts
+            .iter()
+            .map(|record| record["request_purpose"].as_str().expect("purpose"))
+            .collect::<Vec<_>>(),
+        vec!["serve", "compact_summary", "serve"]
+    );
+    assert_eq!(starts[1]["decision_epoch"], 1);
+    assert_eq!(starts[1]["decision_action"], "COMPACT");
+    assert_eq!(starts[1]["compaction_kind"], "policy");
+    assert_eq!(starts[1]["compaction_id"], "phase8a-test-run:compact:1");
+    assert_eq!(starts[1]["reset_id"], "phase8a-test-run:reset:1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controlled_policy_gates_native_pre_turn_context_limit_compaction() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let first_turn = sse(vec![
+        ev_assistant_message("m1", FIRST_REPLY),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 96),
+    ]);
+    let second_turn = sse(vec![
+        ev_assistant_message("m2", FINAL_REPLY),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 10),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![first_turn, second_turn]).await;
+
+    let policy_dir = TempDir::new().expect("create policy log directory");
+    let policy_path = policy_dir.path().join("pre-turn.jsonl");
+    let policy_path_absolute = AbsolutePathBuf::from_absolute_path(&policy_path)
+        .expect("policy log path should be absolute");
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config.model_context_window = Some(100);
+        config.model_auto_compact_token_limit = Some(90);
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        config.experimental_context_policy =
+            controlled_policy_config(ContextPolicyMode::ExternalStub, policy_path_absolute);
+    });
+    let test = builder.build(&server).await.expect("build test codex");
+
+    test.submit_text_turn("first controlled turn")
+        .await
+        .expect("submit first turn");
+    test.submit_text_turn("second controlled turn")
+        .await
+        .expect("submit second turn");
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "controlled mode must gate native pre-turn context-limit compaction"
+    );
+    assert!(
+        !requests.iter().any(|request| body_contains_text(
+            &request.body_json().to_string(),
+            SUMMARIZATION_PROMPT
+        )),
+        "always-KEEP must not issue a hidden pre-turn summary request"
+    );
+    let records = read_policy_records(&policy_path);
+    let decisions = records
+        .iter()
+        .filter(|record| record["event"] == "decision")
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions[0]["epoch"], 0);
+    assert_eq!(decisions[1]["epoch"], 1);
+    assert!(decisions.iter().all(|record| record["action"] == "KEEP"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mpc_bridge_and_estimator_trajectory_persist_across_host_turns() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("m-one", FIRST_REPLY),
+                ev_completed_with_tokens("r-one", 10),
+            ]),
+            sse(vec![
+                ev_assistant_message("m-two", FINAL_REPLY),
+                ev_completed_with_tokens("r-two", 10),
+            ]),
+        ],
+    )
+    .await;
+    let policy_dir = TempDir::new().expect("create policy fixture directory");
+    let raw_log_path = policy_dir.path().join("persistent-policy.jsonl");
+    let raw_log_path = AbsolutePathBuf::from_absolute_path(&raw_log_path)
+        .expect("policy log path should be absolute");
+    let (policy, protocol_log) = persistent_bridge_fixture(&policy_dir, raw_log_path, "ok");
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        config.experimental_context_policy = policy;
+    });
+    let test = builder.build(&server).await.expect("build test codex");
+
+    test.submit_text_turn("first MPC host turn")
+        .await
+        .expect("submit first turn");
+    test.submit_text_turn("second MPC host turn")
+        .await
+        .expect("submit second turn");
+    test.codex
+        .submit(Op::Shutdown)
+        .await
+        .expect("shutdown session");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    assert_eq!(request_log.requests().len(), 2);
+    let protocol = fs::read_to_string(protocol_log).expect("read bridge protocol log");
+    let events = protocol
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("valid fixture record"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().expect("event type"))
+            .collect::<Vec<_>>(),
+        vec![
+            "initialize",
+            "decide",
+            "observe_transition",
+            "decide",
+            "terminal",
+            "shutdown",
+        ]
+    );
+    assert_eq!(events[1]["epoch"], 0);
+    assert_eq!(events[2]["epoch"], 1);
+    assert_eq!(events[3]["epoch"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_finalization_failure_is_reported_instead_of_shutdown_success() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("m-terminal-failure", FINAL_REPLY),
+            ev_completed_with_tokens("r-terminal-failure", 10),
+        ]),
+    )
+    .await;
+    let policy_dir = TempDir::new().expect("create policy fixture directory");
+    let raw_log_path = policy_dir.path().join("terminal-failure-policy.jsonl");
+    let raw_log_path = AbsolutePathBuf::from_absolute_path(&raw_log_path)
+        .expect("policy log path should be absolute");
+    let (policy, _) = persistent_bridge_fixture(&policy_dir, raw_log_path, "terminal_failure");
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        config.experimental_context_policy = policy;
+    });
+    let test = builder.build(&server).await.expect("build test codex");
+
+    test.submit_text_turn("terminal failure fixture")
+        .await
+        .expect("submit turn");
+    test.codex
+        .submit(Op::Shutdown)
+        .await
+        .expect("submit shutdown");
+    let EventMsg::Error(error) =
+        wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await
+    else {
+        unreachable!("predicate guarantees an error event");
+    };
+    assert!(
+        error
+            .message
+            .contains("Failed to finalize context policy trajectory")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn planner_emergency_after_a_real_interval_is_a_distinct_censored_terminal() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let request_log = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("m-before-emergency", FIRST_REPLY),
+            ev_completed_with_tokens("r-before-emergency", 10),
+        ]),
+    )
+    .await;
+    let policy_dir = TempDir::new().expect("create policy fixture directory");
+    let raw_log_path = policy_dir.path().join("planner-emergency-policy.jsonl");
+    let raw_log_path = AbsolutePathBuf::from_absolute_path(&raw_log_path)
+        .expect("policy log path should be absolute");
+    let (mut policy, protocol_log) =
+        persistent_bridge_fixture(&policy_dir, raw_log_path, "emergency_after_first");
+    let request_path = policy_dir.path().join("planner-emergency-requests.jsonl");
+    policy.request_raw_log_path = Some(
+        AbsolutePathBuf::from_absolute_path(&request_path)
+            .expect("request log path should be absolute"),
+    );
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        config.experimental_context_policy = policy;
+    });
+    let test = builder.build(&server).await.expect("build test codex");
+
+    test.submit_text_turn("successful epoch before emergency")
+        .await
+        .expect("submit first turn");
+    test.submit_text_turn("planner emergency epoch")
+        .await
+        .expect("submit emergency turn");
+    test.codex
+        .submit(Op::Shutdown)
+        .await
+        .expect("shutdown session");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    assert_eq!(request_log.requests().len(), 1);
+    let protocol = fs::read_to_string(protocol_log).expect("read bridge protocol log");
+    let events = protocol
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("valid fixture record"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().expect("event type"))
+            .collect::<Vec<_>>(),
+        vec![
+            "initialize",
+            "decide",
+            "observe_transition",
+            "decide",
+            "terminal",
+            "shutdown",
+        ]
+    );
+    assert_eq!(events[4]["reason"], "planner_emergency_censored");
+    let request_records = read_request_records(&request_path);
+    assert_eq!(
+        request_records
+            .iter()
+            .filter(|record| record["event"] == "request_started")
+            .count(),
+        1,
+        "actionless emergency must not fabricate a second request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controlled_fixed_and_external_stub_use_the_native_compactor_and_rebuild_context() {
+    skip_if_no_network!();
+
+    for mode in [
+        ContextPolicyMode::ControlledFixed,
+        ContextPolicyMode::ExternalStub,
+    ] {
+        let server = start_mock_server().await;
+        let summary = format!("{SUMMARY_TEXT}-{mode:?}");
+        let compact_turn = sse(vec![
+            ev_assistant_message("m1", &summary),
+            ev_completed_with_tokens("r1", /*total_tokens*/ 10),
+        ]);
+        let serve_turn = sse(vec![
+            ev_assistant_message("m2", FINAL_REPLY),
+            ev_completed_with_tokens("r2", /*total_tokens*/ 10),
+        ]);
+        let request_log = mount_sse_sequence(&server, vec![compact_turn, serve_turn]).await;
+
+        let policy_dir = TempDir::new().expect("create policy log directory");
+        let policy_path = policy_dir.path().join(format!("{mode:?}.jsonl"));
+        let policy_path_absolute = AbsolutePathBuf::from_absolute_path(&policy_path)
+            .expect("policy log path should be absolute");
+        let model_provider = non_openai_model_provider(&server);
+        let mut builder = test_codex().with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config
+                .features
+                .disable(Feature::TokenBudget)
+                .expect("disable TokenBudget");
+            config.experimental_context_policy = match mode {
+                ContextPolicyMode::ControlledFixed => {
+                    controlled_policy_config(mode, policy_path_absolute)
+                }
+                ContextPolicyMode::ExternalStub => {
+                    controlled_compact_at_epoch_zero(policy_path_absolute)
+                }
+                ContextPolicyMode::NativeFixed
+                | ContextPolicyMode::MpcH1
+                | ContextPolicyMode::Mpc => unreachable!(),
+            };
+        });
+        let codex = builder
+            .build(&server)
+            .await
+            .expect("build test codex")
+            .codex;
+
+        codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "controlled compact input".into(),
+                text_elements: Vec::new(),
+            }]))
+            .await
+            .expect("submit user turn");
+        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+        let requests = request_log.requests();
+        assert_eq!(requests.len(), 2, "{mode:?} should compact then serve");
+        assert!(
+            body_contains_text(&requests[0].body_json().to_string(), SUMMARIZATION_PROMPT),
+            "{mode:?} should invoke the existing traditional summary request"
+        );
+        assert!(
+            requests[1].body_json().to_string().contains(&summary),
+            "{mode:?} should rebuild the serving context from the native compactor output"
+        );
+        assert!(
+            !body_contains_text(&requests[1].body_json().to_string(), SUMMARIZATION_PROMPT),
+            "the normal serving request must not retain the compaction trigger"
+        );
+
+        let records = read_policy_records(&policy_path);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["event"], "decision");
+        assert_eq!(records[0]["action"], "COMPACT");
+        assert_eq!(records[0]["compaction_reason"], "context_limit");
+        assert_eq!(records[1]["event"], "ready_to_invoke");
+        assert_eq!(records[1]["action"], "COMPACT");
+        assert_eq!(
+            records[1]["model_visible_request"]["input"],
+            requests[1].body_json()["input"],
+            "ready evidence must match the rebuilt request that was served"
+        );
+        assert!(
+            records[1]["model_visible_request"]["input"]
+                .to_string()
+                .contains(&summary),
+            "ready-to-invoke evidence must contain the rebuilt context"
+        );
+    }
+}
+
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
 #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
@@ -2305,6 +3102,10 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
     )
     .await;
 
+    let policy_dir = TempDir::new().expect("create policy log directory");
+    let policy_path = policy_dir.path().join("model-downshift.jsonl");
+    let policy_path_absolute = AbsolutePathBuf::from_absolute_path(&policy_path)
+        .expect("policy log path should be absolute");
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
@@ -2313,6 +3114,12 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
             config.update_plan_enabled = true;
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
+            config
+                .features
+                .disable(Feature::TokenBudget)
+                .expect("disable TokenBudget");
+            config.experimental_context_policy =
+                controlled_policy_config(ContextPolicyMode::ExternalStub, policy_path_absolute);
         });
     let test = builder.build(&server).await.expect("build test codex");
 
@@ -2352,6 +3159,21 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
         &requests[2].body_json(),
         previous_model,
         next_model,
+    );
+    let policy_records = read_policy_records(&policy_path);
+    assert_eq!(
+        policy_records
+            .iter()
+            .filter(|record| record["event"] == "decision")
+            .count(),
+        2
+    );
+    assert!(
+        policy_records
+            .iter()
+            .filter(|record| record["event"] == "decision")
+            .all(|record| record["action"] == "KEEP"),
+        "ModelDownshift compaction must bypass the research action"
     );
 
     insta::assert_snapshot!(
@@ -2408,6 +3230,10 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
     )
     .await;
 
+    let policy_dir = TempDir::new().expect("create policy log directory");
+    let policy_path = policy_dir.path().join("comp-hash-change.jsonl");
+    let policy_path_absolute = AbsolutePathBuf::from_absolute_path(&policy_path)
+        .expect("policy log path should be absolute");
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
@@ -2415,6 +3241,12 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
         .with_config(move |config| {
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
+            config
+                .features
+                .disable(Feature::TokenBudget)
+                .expect("disable TokenBudget");
+            config.experimental_context_policy =
+                controlled_policy_config(ContextPolicyMode::ExternalStub, policy_path_absolute);
         });
     let test = builder.build(&server).await.expect("build test codex");
 
@@ -2454,6 +3286,21 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
         &requests[2].body_json(),
         previous_model,
         next_model,
+    );
+    let policy_records = read_policy_records(&policy_path);
+    assert_eq!(
+        policy_records
+            .iter()
+            .filter(|record| record["event"] == "decision")
+            .count(),
+        2
+    );
+    assert!(
+        policy_records
+            .iter()
+            .filter(|record| record["event"] == "decision")
+            .all(|record| record["action"] == "KEEP"),
+        "CompHashChanged compaction must bypass the research action"
     );
 }
 
@@ -3004,6 +3851,10 @@ async fn pre_sampling_legacy_remote_compact_falls_back_after_previous_model_inva
         ],
     )
     .await;
+    let ledger_dir = TempDir::new().expect("create request ledger directory");
+    let raw_request_path = ledger_dir.path().join("legacy-remote-requests.raw.jsonl");
+    let raw_request_path_absolute = AbsolutePathBuf::from_absolute_path(&raw_request_path)
+        .expect("request ledger path should be absolute");
 
     let model_provider = openai_model_provider(&server);
     let mut builder = test_codex()
@@ -3013,6 +3864,11 @@ async fn pre_sampling_legacy_remote_compact_falls_back_after_previous_model_inva
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
             let _ = config.features.disable(Feature::RemoteCompactionV2);
+            config.experimental_context_policy.run_id = Some("legacy-remote-run".to_string());
+            config.experimental_context_policy.task_id = Some("legacy-remote-task".to_string());
+            config.experimental_context_policy.replicate_id = Some(0);
+            config.experimental_context_policy.request_raw_log_path =
+                Some(raw_request_path_absolute);
         });
     let test = builder.build(&server).await.expect("build test codex");
 
@@ -3044,6 +3900,26 @@ async fn pre_sampling_legacy_remote_compact_falls_back_after_previous_model_inva
     assert_eq!(models_mock.requests().len(), 1);
     assert_eq!(requests.len(), 2);
     assert_eq!(compact_requests.len(), 2);
+    let raw_records = read_request_records(&raw_request_path);
+    let starts = raw_records
+        .iter()
+        .filter(|record| record["event"] == "request_started")
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 3);
+    assert_eq!(starts[0]["request_purpose"], "serve");
+    assert_eq!(starts[1]["request_purpose"], "compact_summary");
+    assert_eq!(starts[2]["request_purpose"], "serve");
+    let summary_id = starts[1]["logical_request_id"].clone();
+    assert_eq!(
+        raw_records
+            .iter()
+            .filter(|record| {
+                record["logical_request_id"] == summary_id && record["event"] == "attempt_started"
+            })
+            .count(),
+        2,
+        "legacy endpoint model fallback remains one logical summary lifecycle"
+    );
     assert_eq!(
         requests[0].body_json()["model"].as_str(),
         Some(retired_model)
@@ -5514,6 +6390,8 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     )
     .await;
     let home = Arc::new(TempDir::new()?);
+    let raw_request_path = home.path().join("remote-v2-requests.raw.jsonl");
+    let raw_request_path_absolute = AbsolutePathBuf::from_absolute_path(&raw_request_path)?;
     let source = write_global_file(
         home.as_ref(),
         GLOBAL_AGENTS_FILENAME,
@@ -5522,8 +6400,16 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     let mut builder = test_codex()
         .with_home(Arc::clone(&home))
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_config(|config| {
-            let _ = config.features.enable(Feature::RemoteCompactionV2);
+        .with_config({
+            let raw_request_path_absolute = raw_request_path_absolute.clone();
+            move |config| {
+                let _ = config.features.enable(Feature::RemoteCompactionV2);
+                config.experimental_context_policy.run_id = Some("remote-v2-run".to_string());
+                config.experimental_context_policy.task_id = Some("remote-v2-task".to_string());
+                config.experimental_context_policy.replicate_id = Some(0);
+                config.experimental_context_policy.request_raw_log_path =
+                    Some(raw_request_path_absolute);
+            }
         });
     let test = builder.build(&server).await?;
 
@@ -5547,6 +6433,14 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     // creation-time item despite the file-backed source now containing new text.
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 3);
+    let raw_request_starts = read_request_records(&raw_request_path)
+        .into_iter()
+        .filter(|record| record["event"] == "request_started")
+        .collect::<Vec<_>>();
+    assert_eq!(raw_request_starts.len(), 3);
+    assert_eq!(raw_request_starts[0]["request_purpose"], "serve");
+    assert_eq!(raw_request_starts[1]["request_purpose"], "compact_summary");
+    assert_eq!(raw_request_starts[2]["request_purpose"], "serve");
     let old_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
     assert_single_instruction_fragment(&requests[0], &old_fragment);
     assert_single_instruction_fragment(&requests[1], &old_fragment);
@@ -5584,9 +6478,17 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     let mut resume_builder = test_codex()
         .with_home(Arc::clone(&home))
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_config(move |config| {
-            config.cwd = resumed_cwd;
-            let _ = config.features.enable(Feature::RemoteCompactionV2);
+        .with_config({
+            let raw_request_path_absolute = raw_request_path_absolute.clone();
+            move |config| {
+                config.cwd = resumed_cwd;
+                let _ = config.features.enable(Feature::RemoteCompactionV2);
+                config.experimental_context_policy.run_id = Some("remote-v2-run".to_string());
+                config.experimental_context_policy.task_id = Some("remote-v2-task".to_string());
+                config.experimental_context_policy.replicate_id = Some(0);
+                config.experimental_context_policy.request_raw_log_path =
+                    Some(raw_request_path_absolute);
+            }
         });
     let resumed = resume_builder
         .resume(&server, Arc::clone(&home), rollout_path)
@@ -5599,6 +6501,16 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     // an explicit replacement.
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 4);
+    let raw_request_starts = read_request_records(&raw_request_path)
+        .into_iter()
+        .filter(|record| record["event"] == "request_started")
+        .collect::<Vec<_>>();
+    assert_eq!(raw_request_starts.len(), 4);
+    assert_eq!(raw_request_starts[3]["request_index"], 3);
+    assert_eq!(
+        raw_request_starts[3]["logical_request_id"],
+        "remote-v2-run:request:3"
+    );
     let replacement_fragment = expected_instruction_fragment(&format!(
         "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{NEW_GLOBAL_INSTRUCTIONS}"
     ));

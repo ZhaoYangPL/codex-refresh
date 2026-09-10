@@ -100,7 +100,7 @@ pub(super) async fn suspend_turn_and_shutdown(
     // Stop all producers before flushing their final history and closing its writer.
     // If either persistence step fails, do not report success: the current worker
     // retains ownership until worker-failure recovery can take responsibility.
-    handlers::shutdown_session_runtime(session).await;
+    handlers::shutdown_session_runtime(session, "infrastructure_failure_censored").await?;
     live_thread.flush().await.map_err(|error| {
         CodexErr::Fatal(format!("flush after root turn suspension failed: {error}"))
     })?;

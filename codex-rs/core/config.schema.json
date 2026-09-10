@@ -1164,6 +1164,162 @@
       },
       "type": "object"
     },
+    "ContextPolicyConfig": {
+      "description": "Experimental context-policy configuration for the pinned Codex research fork.",
+      "properties": {
+        "bridge_args": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "bridge_command": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "default": null
+        },
+        "bridge_timeout_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "bridge_working_directory": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "default": null
+        },
+        "controller_config_id": {
+          "default": null,
+          "type": "string"
+        },
+        "external_stub": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExternalContextPolicyStub"
+            }
+          ],
+          "default": null
+        },
+        "external_stub_compact_at_epoch": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "fixed_threshold_tokens": {
+          "default": null,
+          "format": "int64",
+          "type": "integer"
+        },
+        "mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ContextPolicyMode"
+            }
+          ],
+          "default": "native_fixed"
+        },
+        "pricing_schedule_id": {
+          "default": null,
+          "description": "Frozen schedule selected by the research artifact manifest, if any.",
+          "type": "string"
+        },
+        "raw_log_path": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "default": null
+        },
+        "recovery_artifact_id": {
+          "default": null,
+          "type": "string"
+        },
+        "replicate_id": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "request_raw_log_path": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "default": null,
+          "description": "Append-only Phase 8C provider-request lifecycle event log."
+        },
+        "run_id": {
+          "default": null,
+          "type": "string"
+        },
+        "seed": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "task_id": {
+          "default": null,
+          "type": "string"
+        },
+        "z_schema_version": {
+          "default": null,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "ContextPolicyMode": {
+      "description": "Selects the context-limit timing behavior used by the Phase 8 experiment host.",
+      "oneOf": [
+        {
+          "description": "Preserve the pinned upstream pre-turn and mid-turn context-limit behavior.",
+          "enum": [
+            "native_fixed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Use the canonical pre-invocation seam with a fixed token threshold.",
+          "enum": [
+            "controlled_fixed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Use a deterministic in-process stand-in for a future external policy bridge.",
+          "enum": [
+            "external_stub"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Invoke the accepted controller through the Phase 8B bridge with H=1.",
+          "enum": [
+            "mpc_h1"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Invoke the accepted controller through the Phase 8B bridge with frozen H>1.",
+          "enum": [
+            "mpc"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "CurrentTimeReminderConfigToml": {
       "additionalProperties": false,
       "properties": {
@@ -1256,6 +1412,14 @@
         }
       },
       "type": "object"
+    },
+    "ExternalContextPolicyStub": {
+      "description": "Deterministic policy used to validate the external-policy side of the Phase 8A seam.",
+      "enum": [
+        "always_keep",
+        "compact_at_epoch"
+      ],
+      "type": "string"
     },
     "FeatureToml_for_CodeModeConfigToml": {
       "anyOf": [
@@ -5980,6 +6144,14 @@
     },
     "experimental_compact_prompt_file": {
       "$ref": "#/definitions/AbsolutePathBuf"
+    },
+    "experimental_context_policy": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ContextPolicyConfig"
+        }
+      ],
+      "description": "Phase 8 research-fork configuration. Defaults to upstream-parity `native_fixed`."
     },
     "experimental_realtime_start_instructions": {
       "description": "Experimental / do not use. Replaces the built-in realtime start instructions inserted into developer messages when realtime becomes active.",

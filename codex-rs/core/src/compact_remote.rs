@@ -5,9 +5,11 @@ use crate::compact::CompactedHistoryMetadata;
 use crate::compact::CompactionAnalyticsAttempt;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::InitialContextInjection;
+use crate::compact::begin_compaction_raw_request;
 use crate::compact::build_compaction_initial_context;
 use crate::compact::compaction_status_from_result;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
+use crate::compact::record_compaction_request_failure;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote_history::HistoryItemGroup;
@@ -19,6 +21,7 @@ use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
 use crate::hook_runtime::run_post_compact_hooks;
 use crate::hook_runtime::run_pre_compact_hooks;
+use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -212,6 +215,23 @@ async fn run_remote_compact_task_inner_impl(
     let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
+    let responses_metadata = sess
+        .responses_metadata(
+            turn_context.as_ref(),
+            CodexResponsesRequestKind::Compaction(compaction_metadata),
+        )
+        .await;
+    let raw_request = begin_compaction_raw_request(
+        sess.as_ref(),
+        turn_context.as_ref(),
+        &responses_metadata,
+        compaction_metadata,
+    )
+    .await?;
+    if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), raw_request.as_ref()) {
+        // Attempt 0 runs on the request identity itself, so no override is needed.
+        ledger.attempt_started(request, 0, None).await?;
+    }
     let attempt = run_remote_compact_attempt(
         sess,
         step_context,
@@ -224,15 +244,44 @@ async fn run_remote_compact_task_inner_impl(
     let (attempt, compaction_turn_context) = match attempt {
         Ok(attempt) => (attempt, turn_context),
         Err(error) => {
+            let can_fallback =
+                fallback_step_context.is_some() && should_retry_with_current_model(&error);
+            record_compaction_request_failure(
+                sess.as_ref(),
+                raw_request.as_ref(),
+                0,
+                &error,
+                !can_fallback,
+                None,
+            )
+            .await?;
             let Some(fallback_step_context) = fallback_step_context else {
                 return Err(error);
             };
             if !should_retry_with_current_model(&error) {
                 return Err(error);
             }
+            let fallback_turn_context = &fallback_step_context.turn;
+            // The retry runs on another model/provider but stays inside the same
+            // logical compaction lifecycle; record the attempt's own identity so
+            // accounting never attributes it to the original model.  The provider
+            // identifier must come from the same namespace as the request-level
+            // one (`config.model_provider_id`), otherwise an ordinary
+            // same-provider request looks like a provider fallback.
+            let fallback_identity = crate::request_ledger::attempt_identity(
+                fallback_turn_context.config.model_provider_id.as_str(),
+                fallback_turn_context.model_info().slug.as_str(),
+            );
+            if let (Some(ledger), Some(request)) =
+                (sess.request_ledger.as_ref(), raw_request.as_ref())
+            {
+                ledger.retry_scheduled(request, 0, 0.0).await?;
+                ledger
+                    .attempt_started(request, 1, Some(&fallback_identity))
+                    .await?;
+            }
             sess.set_last_known_step_context(fallback_step_context)
                 .await;
-            let fallback_turn_context = &fallback_step_context.turn;
             let fallback_compaction_trace =
                 sess.services.rollout_thread_trace.compaction_trace_context(
                     fallback_turn_context.sub_id.as_str(),
@@ -259,7 +308,18 @@ async fn run_remote_compact_task_inner_impl(
             );
             match fallback_result {
                 Ok(attempt) => (attempt, fallback_turn_context),
-                Err(_) => return Err(error),
+                Err(fallback_error) => {
+                    record_compaction_request_failure(
+                        sess.as_ref(),
+                        raw_request.as_ref(),
+                        1,
+                        &fallback_error,
+                        true,
+                        Some(&fallback_identity),
+                    )
+                    .await?;
+                    return Err(error);
+                }
             }
         }
     };
@@ -267,6 +327,29 @@ async fn run_remote_compact_task_inner_impl(
         new_history,
         trace_input_history,
     } = attempt;
+    if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), raw_request.as_ref()) {
+        let visible_output_tokens = new_history
+            .iter()
+            .map(crate::context_policy::visible_output_token_count)
+            .sum();
+        // The terminal attempt may have been the fallback one; attribute it to
+        // whichever turn context actually produced the compacted history, using
+        // the canonical provider identifier shared with `request_started`.
+        let terminal_identity = crate::request_ledger::attempt_identity(
+            compaction_turn_context.config.model_provider_id.as_str(),
+            compaction_turn_context.model_info().slug.as_str(),
+        );
+        ledger
+            .completed(
+                request,
+                None,
+                None,
+                Some(visible_output_tokens),
+                "completed",
+                Some(&terminal_identity),
+            )
+            .await?;
+    }
     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
     let (new_history, world_state_baseline) =
         process_compacted_history(sess.as_ref(), new_history, &initial_context_injection).await;

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use super::RawCompactionAttemptState;
 use super::RemoteCompactionV2Output;
 use super::run_remote_compaction_request_v2;
 use crate::Prompt;
@@ -35,6 +36,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
     compaction_trace: &CompactionTraceContext,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
+    raw_state: RawCompactionAttemptState<'_>,
 ) -> CodexResult<RemoteCompactV2Attempt> {
     let turn_context = &step_context.turn;
     let mut history = sess.clone_history().await;
@@ -107,6 +109,8 @@ pub(super) async fn run_remote_compact_v2_attempt(
         client_session,
         &prompt,
         &responses_metadata,
+        raw_state.request,
+        raw_state.next_attempt_index,
     )
     .await;
     trace_attempt.record_result(

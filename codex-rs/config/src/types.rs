@@ -60,6 +60,82 @@ const fn default_enabled() -> bool {
     true
 }
 
+/// Selects the context-limit timing behavior used by the Phase 8 experiment host.
+#[derive(Serialize, Deserialize, Debug, Default, Copy, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextPolicyMode {
+    /// Preserve the pinned upstream pre-turn and mid-turn context-limit behavior.
+    #[default]
+    NativeFixed,
+    /// Use the canonical pre-invocation seam with a fixed token threshold.
+    ControlledFixed,
+    /// Use a deterministic in-process stand-in for a future external policy bridge.
+    ExternalStub,
+    /// Invoke the accepted controller through the Phase 8B bridge with H=1.
+    MpcH1,
+    /// Invoke the accepted controller through the Phase 8B bridge with frozen H>1.
+    Mpc,
+}
+
+/// Deterministic policy used to validate the external-policy side of the Phase 8A seam.
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalContextPolicyStub {
+    AlwaysKeep,
+    CompactAtEpoch,
+}
+
+/// Experimental context-policy configuration for the pinned Codex research fork.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(default)]
+pub struct ContextPolicyConfig {
+    pub mode: ContextPolicyMode,
+    pub fixed_threshold_tokens: Option<i64>,
+    pub external_stub: Option<ExternalContextPolicyStub>,
+    pub external_stub_compact_at_epoch: Option<u64>,
+    pub run_id: Option<String>,
+    pub task_id: Option<String>,
+    pub replicate_id: Option<u64>,
+    pub raw_log_path: Option<AbsolutePathBuf>,
+    /// Append-only Phase 8C provider-request lifecycle event log.
+    pub request_raw_log_path: Option<AbsolutePathBuf>,
+    /// Frozen schedule selected by the research artifact manifest, if any.
+    pub pricing_schedule_id: Option<String>,
+    pub bridge_command: Option<AbsolutePathBuf>,
+    pub bridge_args: Vec<String>,
+    pub bridge_working_directory: Option<AbsolutePathBuf>,
+    pub bridge_timeout_ms: Option<u64>,
+    pub controller_config_id: Option<String>,
+    pub recovery_artifact_id: Option<String>,
+    pub z_schema_version: Option<String>,
+    pub seed: Option<u64>,
+}
+
+impl Default for ContextPolicyConfig {
+    fn default() -> Self {
+        Self {
+            mode: ContextPolicyMode::NativeFixed,
+            fixed_threshold_tokens: None,
+            external_stub: None,
+            external_stub_compact_at_epoch: None,
+            run_id: None,
+            task_id: None,
+            replicate_id: None,
+            raw_log_path: None,
+            request_raw_log_path: None,
+            pricing_schedule_id: None,
+            bridge_command: None,
+            bridge_args: Vec::new(),
+            bridge_working_directory: None,
+            bridge_timeout_ms: None,
+            controller_config_id: None,
+            recovery_artifact_id: None,
+            z_schema_version: None,
+            seed: None,
+        }
+    }
+}
+
 /// Preferred layout for the resume/fork session picker.
 #[derive(Serialize, Deserialize, Debug, Default, Copy, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]

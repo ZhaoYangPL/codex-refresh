@@ -14,6 +14,8 @@ use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_
 use crate::connectors;
 use crate::context::ContextualUserFragment;
 use crate::context::UserVerificationNotice;
+use crate::context_policy::ContextPolicyAction;
+use crate::context_policy::ContextPolicyObservation;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::feedback_tags;
 use crate::hook_runtime::drain_async_hook_results;
@@ -29,6 +31,10 @@ use crate::mentions::collect_explicit_app_ids;
 use crate::mentions::collect_explicit_plugin_mentions;
 use crate::mentions::collect_tool_mentions_from_messages;
 use crate::plugins::build_plugin_injections;
+use crate::request_ledger::RawRequestHandle;
+use crate::request_ledger::RequestDescriptor;
+use crate::request_ledger::RequestLinkage;
+use crate::request_ledger::RequestPurpose;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_retry::ResponsesStreamRequest;
@@ -105,6 +111,7 @@ use codex_protocol::protocol::ReasoningContentDeltaEvent;
 use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
 use codex_protocol::protocol::SafetyBufferingEvent;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
@@ -438,6 +445,10 @@ pub(crate) async fn run_turn(
                 &mut client_session,
                 &responses_metadata,
                 sampling_request_input,
+                InitialContextInjection::BeforeLastUserMessage {
+                    world_state: Arc::clone(&world_state),
+                    step_context: Arc::clone(&step_context),
+                },
                 cancellation_token.child_token(),
             )
             .await
@@ -448,6 +459,7 @@ pub(crate) async fn run_turn(
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
+                    ..
                 } = sampling_request_output;
                 if model_needs_follow_up {
                     sess.input_queue
@@ -507,7 +519,9 @@ pub(crate) async fn run_turn(
                     );
                 }
 
-                let should_roll_over = needs_follow_up
+                let should_roll_over = crate::context_policy::native_context_limit_enabled(
+                    &turn_context.config.experimental_context_policy,
+                ) && needs_follow_up
                     && (sess.take_new_context_window_request().await || token_limit_reached);
                 let allow_auto_compact_fallback = !should_roll_over && !token_limit_reached;
                 super::token_budget::maybe_record(
@@ -1098,6 +1112,11 @@ async fn run_pre_sampling_compact(
 ) -> CodexResult<()> {
     maybe_run_previous_model_inline_compact(sess, turn_context, client_session, cancellation_token)
         .await?;
+    if !crate::context_policy::native_context_limit_enabled(
+        &turn_context.config.experimental_context_policy,
+    ) {
+        return Ok(());
+    }
     let token_status =
         super::context_window::context_window_token_status(sess.as_ref(), turn_context.as_ref())
             .await;
@@ -1427,6 +1446,7 @@ async fn run_sampling_request(
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     input: Vec<ResponseItem>,
+    context_policy_initial_context_injection: InitialContextInjection,
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
     let turn_context = Arc::clone(&step_context.turn);
@@ -1447,6 +1467,13 @@ async fn run_sampling_request(
     let mut initial_input = Some(input);
     let mut original_input = None;
     let mut executed_tool_calls_by_output = HashMap::new();
+    let thread_id = sess.thread_id.to_string();
+    let mut context_policy_pending = true;
+    let mut request_linkage = RequestLinkage::default();
+    let mut raw_request: Option<RawRequestHandle> = None;
+    let mut attempt_index = 0_u64;
+    let mut context_policy_initial_context_injection =
+        Some(context_policy_initial_context_injection);
     loop {
         // A retry must not attribute the next tool call to the previous response.
         turn_context
@@ -1466,11 +1493,195 @@ async fn run_sampling_request(
         {
             codex_protocol::models::bound_executed_tool_calls_for_prompt(&mut prompt_input);
         }
-        let prompt = build_prompt(
+        let mut prompt = build_prompt(
             prompt_input,
             step_context.as_ref(),
             base_instructions.clone(),
         );
+        let controlled = sess
+            .context_policy
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(crate::context_policy::ContextPolicySeam::is_controlled);
+        let decision = if context_policy_pending && controlled {
+            context_policy_pending = false;
+            let epoch = sess
+                .next_context_policy_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let model_visible_request = client_session.model_visible_context_snapshot(
+                &prompt,
+                &step_context.settings.model_info,
+                responses_metadata,
+            )?;
+            let observation = ContextPolicyObservation::new(
+                &prompt,
+                model_visible_request,
+                &step_context.settings.model_info,
+                &thread_id,
+                &turn_context.sub_id,
+                &turn_context.config.model_provider_id,
+            );
+            let mut policy = sess.take_context_policy().await?;
+            let result = policy.decide(epoch, observation).await;
+            sess.restore_context_policy(policy).await;
+            result?
+        } else {
+            None
+        };
+        if let Some(decision) = decision {
+            let Some(action) = decision.action else {
+                let mut policy = sess.take_context_policy().await?;
+                let result = policy
+                    .terminal(
+                        sess.next_context_policy_epoch
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                        "planner_emergency_censored",
+                    )
+                    .await;
+                sess.restore_context_policy(policy).await;
+                result?;
+                return Err(CodexErr::InvalidRequest(
+                    "context policy planner emergency: no feasible KEEP/COMPACT action".to_string(),
+                ));
+            };
+            if action == ContextPolicyAction::Compact {
+                // A policy decision can compact immediately before a tool follow-up.
+                // Preserve only the not-yet-consumed tool exchange suffix; older tool
+                // traffic remains represented by the compaction summary.
+                let pending_tool_exchange =
+                    pending_tool_exchange_after_last_assistant(&prompt.input);
+                let Some(initial_context_injection) =
+                    context_policy_initial_context_injection.take()
+                else {
+                    return Err(CodexErr::Io(std::io::Error::other(
+                        "controlled policy attempted more than one compaction per sampling invocation",
+                    )));
+                };
+                let linkage = RequestLinkage {
+                    decision_epoch: Some(decision.epoch),
+                    decision_action: Some(action.as_str()),
+                    compaction_id: Some(format!(
+                        "{}:compact:{}",
+                        sess.request_ledger
+                            .as_ref()
+                            .map_or("unidentified-run", |ledger| ledger.run_id()),
+                        decision.epoch
+                    )),
+                    reset_id: Some(format!(
+                        "{}:reset:{}",
+                        sess.request_ledger
+                            .as_ref()
+                            .map_or("unidentified-run", |ledger| ledger.run_id()),
+                        decision.epoch
+                    )),
+                    compaction_kind: Some("policy"),
+                };
+                *sess.request_ledger_compaction_linkage.lock().await = Some(linkage.clone());
+                let compact_result = run_auto_compact(
+                    &sess,
+                    Arc::clone(&step_context),
+                    /*fallback_step_context*/ None,
+                    client_session,
+                    initial_context_injection,
+                    CompactionReason::ContextLimit,
+                    CompactionPhase::MidTurn,
+                )
+                .await;
+                *sess.request_ledger_compaction_linkage.lock().await = None;
+                compact_result?;
+                let mut post_compact_input = sess
+                    .clone_history()
+                    .await
+                    .for_prompt(&step_context.settings.model_info.input_modalities);
+                insert_pending_tool_exchange(&mut post_compact_input, pending_tool_exchange);
+                if let Some(executed_tool_calls) = sess.services.executed_tool_calls.as_ref()
+                    && executed_tool_calls.attach_pending_to_prompt(
+                        &mut post_compact_input,
+                        &mut executed_tool_calls_by_output,
+                    )
+                {
+                    codex_protocol::models::bound_executed_tool_calls_for_prompt(
+                        &mut post_compact_input,
+                    );
+                }
+                prompt = build_prompt(
+                    post_compact_input,
+                    step_context.as_ref(),
+                    base_instructions.clone(),
+                );
+            }
+            request_linkage = RequestLinkage {
+                decision_epoch: Some(decision.epoch),
+                decision_action: Some(action.as_str()),
+                compaction_id: (action == ContextPolicyAction::Compact).then(|| {
+                    format!(
+                        "{}:compact:{}",
+                        sess.request_ledger
+                            .as_ref()
+                            .map_or("unidentified-run", |ledger| ledger.run_id()),
+                        decision.epoch
+                    )
+                }),
+                reset_id: (action == ContextPolicyAction::Compact).then(|| {
+                    format!(
+                        "{}:reset:{}",
+                        sess.request_ledger
+                            .as_ref()
+                            .map_or("unidentified-run", |ledger| ledger.run_id()),
+                        decision.epoch
+                    )
+                }),
+                ..Default::default()
+            };
+            let model_visible_request = client_session.model_visible_context_snapshot(
+                &prompt,
+                &step_context.settings.model_info,
+                responses_metadata,
+            )?;
+            let observation = ContextPolicyObservation::new(
+                &prompt,
+                model_visible_request,
+                &step_context.settings.model_info,
+                &thread_id,
+                &turn_context.sub_id,
+                &turn_context.config.model_provider_id,
+            );
+            let mut policy = sess.take_context_policy().await?;
+            let result = policy.record_ready_to_invoke(decision, observation).await;
+            sess.restore_context_policy(policy).await;
+            result?;
+        }
+        if raw_request.is_none()
+            && let Some(ledger) = sess.request_ledger.as_ref()
+        {
+            raw_request = Some(
+                ledger
+                    .begin_request(RequestDescriptor {
+                        purpose: if matches!(
+                            turn_context.session_source,
+                            SessionSource::Internal(InternalSessionSource::MemoryConsolidation)
+                        ) {
+                            RequestPurpose::Memory
+                        } else {
+                            RequestPurpose::Serve
+                        },
+                        thread_id: &thread_id,
+                        session_id: Some(&responses_metadata.session_id),
+                        turn_id: Some(&turn_context.sub_id),
+                        provider_id: &turn_context.config.model_provider_id,
+                        model_id: &step_context.settings.model_info.slug,
+                        linkage: request_linkage.clone(),
+                    })
+                    .await?,
+            );
+        }
+        if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), raw_request.as_ref())
+        {
+            // A serve lifecycle keeps one model/provider, so the attempt
+            // identity equals the request identity recorded at begin_request.
+            ledger.attempt_started(request, attempt_index, None).await?;
+        }
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
@@ -1485,14 +1696,42 @@ async fn run_sampling_request(
         .await
         {
             Ok(output) => {
+                if let (Some(ledger), Some(request)) =
+                    (sess.request_ledger.as_ref(), raw_request.as_ref())
+                {
+                    ledger
+                        .completed(
+                            request,
+                            output.response_id.as_deref(),
+                            output.token_usage.as_ref(),
+                            output.visible_output_tokens,
+                            output.stop_reason,
+                            None,
+                        )
+                        .await?;
+                }
                 return Ok((output, original_input.unwrap_or(prompt.input)));
             }
             Err(err) => match err.details() {
                 CodexErrorDetails::ContextWindowExceeded => {
+                    record_terminal_request_failure(
+                        &sess,
+                        raw_request.as_ref(),
+                        attempt_index,
+                        &err,
+                    )
+                    .await?;
                     sess.set_total_tokens_full(&turn_context).await;
                     return Err(err);
                 }
                 CodexErrorDetails::UsageLimitReached(e) => {
+                    record_terminal_request_failure(
+                        &sess,
+                        raw_request.as_ref(),
+                        attempt_index,
+                        &err,
+                    )
+                    .await?;
                     let rate_limits = e.rate_limits.clone();
                     if let Some(rate_limits) = rate_limits {
                         sess.update_rate_limits(&turn_context, *rate_limits).await;
@@ -1503,15 +1742,30 @@ async fn run_sampling_request(
             },
         };
 
+        if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), raw_request.as_ref())
+        {
+            let kind = request_failure_kind(&err);
+            ledger
+                .attempt_failed(request, attempt_index, kind, kind, None)
+                .await?;
+        }
+
         if original_input.is_none() {
             original_input = Some(prompt.input);
         }
 
         if !err.is_retryable() {
+            if let (Some(ledger), Some(request)) =
+                (sess.request_ledger.as_ref(), raw_request.as_ref())
+            {
+                let kind = request_failure_kind(&err);
+                ledger.failed(request, kind, kind, None).await?;
+            }
             return Err(err);
         }
 
-        handle_retryable_response_stream_error(
+        let retry_wait_started = std::time::Instant::now();
+        let retry_result = handle_retryable_response_stream_error(
             &mut retry_state,
             max_retries,
             err,
@@ -1520,9 +1774,114 @@ async fn run_sampling_request(
             &turn_context,
             ResponsesStreamRequest::Sampling,
         )
-        .await?;
+        .await;
+        match retry_result {
+            Ok(()) => {
+                if let (Some(ledger), Some(request)) =
+                    (sess.request_ledger.as_ref(), raw_request.as_ref())
+                {
+                    ledger
+                        .retry_scheduled(
+                            request,
+                            attempt_index,
+                            retry_wait_started.elapsed().as_secs_f64(),
+                        )
+                        .await?;
+                }
+            }
+            Err(final_error) => {
+                if let (Some(ledger), Some(request)) =
+                    (sess.request_ledger.as_ref(), raw_request.as_ref())
+                {
+                    let kind = request_failure_kind(&final_error);
+                    ledger.failed(request, kind, kind, None).await?;
+                }
+                return Err(final_error);
+            }
+        }
+        attempt_index += 1;
         turn_context.turn_timing_state.record_sampling_retry();
     }
+}
+
+async fn record_terminal_request_failure(
+    sess: &Session,
+    request: Option<&RawRequestHandle>,
+    attempt_index: u64,
+    error: &CodexErr,
+) -> CodexResult<()> {
+    if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), request) {
+        let kind = request_failure_kind(error);
+        ledger
+            .attempt_failed(request, attempt_index, kind, kind, None)
+            .await?;
+        ledger.failed(request, kind, kind, None).await?;
+    }
+    Ok(())
+}
+
+fn request_failure_kind(error: &CodexErr) -> &'static str {
+    match error.details() {
+        CodexErrorDetails::ContextWindowExceeded => "provider_context_rejection",
+        CodexErrorDetails::UsageLimitReached(_) => "rate_limit",
+        CodexErrorDetails::Interrupted | CodexErrorDetails::TurnAborted => "interrupted",
+        CodexErrorDetails::SessionBudgetExceeded => "session_budget",
+        _ => "provider_or_transport_failure",
+    }
+}
+
+fn pending_tool_exchange_after_last_assistant(input: &[ResponseItem]) -> Vec<ResponseItem> {
+    let start = input
+        .iter()
+        .rposition(|item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"))
+        .map_or(0, |index| index.saturating_add(1));
+    input[start..]
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                ResponseItem::LocalShellCall { .. }
+                    | ResponseItem::FunctionCall { .. }
+                    | ResponseItem::ToolSearchCall { .. }
+                    | ResponseItem::FunctionCallOutput { .. }
+                    | ResponseItem::CustomToolCall { .. }
+                    | ResponseItem::CustomToolCallOutput { .. }
+                    | ResponseItem::ToolSearchOutput { .. }
+                    | ResponseItem::WebSearchCall { .. }
+                    | ResponseItem::ImageGenerationCall { .. }
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn insert_pending_tool_exchange(
+    post_compact_input: &mut Vec<ResponseItem>,
+    pending_tool_exchange: Vec<ResponseItem>,
+) {
+    if pending_tool_exchange.is_empty() {
+        return;
+    }
+    let insertion_index = post_compact_input
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, item)| {
+            let is_summary = match item {
+                ResponseItem::Message { content, .. } => content.iter().any(|content| {
+                    matches!(
+                        content,
+                        ContentItem::InputText { text }
+                            if crate::compact::is_summary_message(text)
+                    )
+                }),
+                ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. } => true,
+                _ => false,
+            };
+            is_summary.then_some(index)
+        })
+        .unwrap_or(post_compact_input.len());
+    post_compact_input.splice(insertion_index..insertion_index, pending_tool_exchange);
 }
 
 pub(crate) struct PreparedToolRecommendations {
@@ -1665,6 +2024,10 @@ pub(crate) async fn built_tools(
 struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
+    response_id: Option<String>,
+    token_usage: Option<TokenUsage>,
+    visible_output_tokens: Option<i64>,
+    stop_reason: &'static str,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -2329,6 +2692,7 @@ async fn try_run_sampling_request(
     let mut in_flight: FuturesOrdered<InFlightFuture<'static>> = FuturesOrdered::new();
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
+    let mut visible_output_tokens = 0_i64;
     let mut active_item: Option<TurnItem> = None;
     let mut active_tool_argument_diff_consumer: Option<(
         String,
@@ -2408,6 +2772,11 @@ async fn try_run_sampling_request(
             }
             ResponseEvent::OutputItemDone(mut item) => {
                 assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
+                visible_output_tokens = visible_output_tokens
+                    .saturating_add(crate::context_policy::visible_output_token_count(&item));
+                if let Some(policy) = sess.context_policy.lock().await.as_mut() {
+                    policy.note_normal_output(&item);
+                }
                 if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
                     let call_id = match &item {
                         ResponseItem::FunctionCall { call_id, .. }
@@ -2515,6 +2884,10 @@ async fn try_run_sampling_request(
                     break Ok(SamplingRequestResult {
                         needs_follow_up: true,
                         last_agent_message,
+                        response_id: None,
+                        token_usage: None,
+                        visible_output_tokens: Some(visible_output_tokens),
+                        stop_reason: "host_preempted_for_mailbox",
                     });
                 }
             }
@@ -2695,6 +3068,10 @@ async fn try_run_sampling_request(
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
+                    response_id: Some(response_id),
+                    token_usage,
+                    visible_output_tokens: Some(visible_output_tokens),
+                    stop_reason: "completed",
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {

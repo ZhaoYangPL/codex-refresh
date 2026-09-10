@@ -14,6 +14,7 @@ use crate::types::AnalyticsConfigToml;
 use crate::types::ApprovalsReviewer;
 use crate::types::AppsConfigToml;
 use crate::types::AuthCredentialsStoreMode;
+use crate::types::ContextPolicyConfig;
 use crate::types::FeedbackConfigToml;
 use crate::types::History;
 use crate::types::MarketplaceConfig;
@@ -170,6 +171,9 @@ pub struct ConfigToml {
     /// Controls whether the auto-compaction limit applies to the full context or
     /// only to tokens after the carried prefix in the current compaction window.
     pub model_auto_compact_token_limit_scope: Option<AutoCompactTokenLimitScope>,
+
+    /// Phase 8 research-fork configuration. Defaults to upstream-parity `native_fixed`.
+    pub experimental_context_policy: Option<ContextPolicyConfig>,
 
     /// Default approval policy for executing commands.
     #[schemars(with = "Option<crate::schema::ConfigAskForApproval>")]

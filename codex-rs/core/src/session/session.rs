@@ -76,6 +76,15 @@ pub(crate) struct Session {
     pub(super) fork_persistence: ForkPersistence,
     pub(super) forked_from_ordinal_exclusive: Option<u64>,
     pub(super) next_internal_sub_id: AtomicU64,
+    /// Monotonic decision epoch for the controlled Phase 8 context-policy seam.
+    pub(super) next_context_policy_epoch: AtomicU64,
+    /// One policy/bridge lifecycle for the entire controlled session trajectory.
+    pub(super) context_policy: Mutex<Option<crate::context_policy::ContextPolicySeam>>,
+    /// Optional append-only raw request evidence stream for Phase 8C.
+    pub(crate) request_ledger: Option<Arc<crate::request_ledger::RawRequestLedger>>,
+    /// Only populated while a policy-selected COMPACT is issuing its summary request.
+    pub(crate) request_ledger_compaction_linkage:
+        Mutex<Option<crate::request_ledger::RequestLinkage>>,
 }
 
 #[derive(Clone)]
@@ -593,6 +602,24 @@ async fn warm_plugins_and_skills_for_session_init(
 }
 
 impl Session {
+    pub(super) async fn take_context_policy(
+        &self,
+    ) -> std::io::Result<crate::context_policy::ContextPolicySeam> {
+        self.context_policy
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| std::io::Error::other("context policy operation already in progress"))
+    }
+
+    pub(super) async fn restore_context_policy(
+        &self,
+        policy: crate::context_policy::ContextPolicySeam,
+    ) {
+        let previous = self.context_policy.lock().await.replace(policy);
+        debug_assert!(previous.is_none(), "context policy restored twice");
+    }
+
     /// Returns the concrete identity for this thread.
     pub(crate) fn thread_id(&self) -> ThreadId {
         self.thread_id
@@ -1537,6 +1564,16 @@ impl Session {
                 fork_persistence,
                 forked_from_ordinal_exclusive,
                 next_internal_sub_id: AtomicU64::new(0),
+                next_context_policy_epoch: AtomicU64::new(0),
+                context_policy: Mutex::new(Some(
+                    crate::context_policy::ContextPolicySeam::new(
+                        config.experimental_context_policy.clone(),
+                    ),
+                )),
+                request_ledger: crate::request_ledger::RawRequestLedger::from_config(
+                    &config.experimental_context_policy,
+                )?,
+                request_ledger_compaction_linkage: Mutex::new(None),
             });
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;

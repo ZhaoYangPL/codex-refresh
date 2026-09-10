@@ -1282,6 +1282,38 @@ impl ModelClientSession {
         Arc::clone(&self.turn_state)
     }
 
+    /// Builds the exact logical context payload that a normal Responses request will expose to
+    /// the model. This deliberately reuses the production request builder and its final item
+    /// preparation so research instrumentation cannot retain provider-hidden metadata or drift
+    /// from Responses Lite prefix construction.
+    pub(crate) fn model_visible_context_snapshot(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        responses_metadata: &CodexResponsesMetadata,
+    ) -> Result<serde_json::Value> {
+        let mut request = self.client.build_responses_request(
+            prompt,
+            model_info,
+            /*effort*/ None,
+            ReasoningSummaryConfig::None,
+            /*service_tier*/ None,
+            responses_metadata,
+        )?;
+        self.client
+            .prepare_response_items_for_request(&mut request.input);
+        Ok(serde_json::json!({
+            "model": &request.model,
+            "instructions": &request.instructions,
+            "input": &request.input,
+            "tools": &request.tools,
+            "parallel_tool_calls": request.parallel_tool_calls,
+            "text": &request.text,
+            "use_responses_lite": model_info.use_responses_lite,
+            "cyber_access_program": prompt.cyber_access_program,
+        }))
+    }
+
     fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
         self.websocket_session.endpoint = None;
