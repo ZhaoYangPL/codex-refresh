@@ -6642,6 +6642,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
         next_context_policy_epoch: AtomicU64::new(0),
+        context_policy: Mutex::new(Some(crate::context_policy::ContextPolicySeam::new(
+            Default::default(),
+        ))),
     };
     let per_turn_config =
         session.build_per_turn_config(&session_configuration, session_configuration.cwd().clone());
@@ -8949,6 +8952,9 @@ where
         forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
         next_context_policy_epoch: AtomicU64::new(0),
+        context_policy: Mutex::new(Some(crate::context_policy::ContextPolicySeam::new(
+            Default::default(),
+        ))),
     });
     let per_turn_config =
         session.build_per_turn_config(&session_configuration, session_configuration.cwd().clone());

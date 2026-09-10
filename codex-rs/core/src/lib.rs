@@ -59,6 +59,7 @@ pub mod connectors;
 pub mod context;
 mod context_manager;
 mod context_policy;
+mod context_policy_bridge;
 mod current_time;
 mod cyber_access_program;
 mod elicitation;

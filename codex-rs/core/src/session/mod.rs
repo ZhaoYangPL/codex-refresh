@@ -3393,6 +3393,9 @@ impl Session {
             .iter()
             .map(|envelope| envelope.item.clone())
             .collect::<Vec<_>>();
+        if let Some(policy) = self.context_policy.lock().await.as_mut() {
+            policy.note_additional_items(&response_items);
+        }
         {
             let mut state = self.state.lock().await;
             state

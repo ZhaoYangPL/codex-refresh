@@ -1167,6 +1167,39 @@
     "ContextPolicyConfig": {
       "description": "Experimental context-policy configuration for the pinned Codex research fork.",
       "properties": {
+        "bridge_args": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "bridge_command": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "default": null
+        },
+        "bridge_timeout_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "bridge_working_directory": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "default": null
+        },
+        "controller_config_id": {
+          "default": null,
+          "type": "string"
+        },
         "external_stub": {
           "allOf": [
             {
@@ -1202,6 +1235,10 @@
           ],
           "default": null
         },
+        "recovery_artifact_id": {
+          "default": null,
+          "type": "string"
+        },
         "replicate_id": {
           "default": null,
           "format": "uint64",
@@ -1212,7 +1249,17 @@
           "default": null,
           "type": "string"
         },
+        "seed": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "task_id": {
+          "default": null,
+          "type": "string"
+        },
+        "z_schema_version": {
           "default": null,
           "type": "string"
         }
@@ -1240,6 +1287,20 @@
           "description": "Use a deterministic in-process stand-in for a future external policy bridge.",
           "enum": [
             "external_stub"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Invoke the accepted controller through the Phase 8B bridge with H=1.",
+          "enum": [
+            "mpc_h1"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Invoke the accepted controller through the Phase 8B bridge with frozen H>1.",
+          "enum": [
+            "mpc"
           ],
           "type": "string"
         }

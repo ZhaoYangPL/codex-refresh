@@ -16,7 +16,6 @@ use crate::context::ContextualUserFragment;
 use crate::context::UserVerificationNotice;
 use crate::context_policy::ContextPolicyAction;
 use crate::context_policy::ContextPolicyObservation;
-use crate::context_policy::ContextPolicySeam;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::feedback_tags;
 use crate::hook_runtime::drain_async_hook_results;
@@ -176,8 +175,6 @@ pub(crate) async fn run_turn(
 
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
-    let mut context_policy =
-        ContextPolicySeam::new(turn_context.config.experimental_context_policy.clone());
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
@@ -443,7 +440,6 @@ pub(crate) async fn run_turn(
                 &mut client_session,
                 &responses_metadata,
                 sampling_request_input,
-                &mut context_policy,
                 InitialContextInjection::BeforeLastUserMessage {
                     world_state: Arc::clone(&world_state),
                     step_context: Arc::clone(&step_context),
@@ -1444,7 +1440,6 @@ async fn run_sampling_request(
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     input: Vec<ResponseItem>,
-    context_policy: &mut ContextPolicySeam,
     context_policy_initial_context_injection: InitialContextInjection,
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
@@ -1494,7 +1489,13 @@ async fn run_sampling_request(
             step_context.as_ref(),
             base_instructions.clone(),
         );
-        let decision = if context_policy_pending && context_policy.is_controlled() {
+        let controlled = sess
+            .context_policy
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(crate::context_policy::ContextPolicySeam::is_controlled);
+        let decision = if context_policy_pending && controlled {
             context_policy_pending = false;
             let epoch = sess
                 .next_context_policy_epoch
@@ -1512,12 +1513,35 @@ async fn run_sampling_request(
                 &turn_context.sub_id,
                 &turn_context.config.model_provider_id,
             );
-            context_policy.decide(epoch, observation).await?
+            let mut policy = sess.take_context_policy().await?;
+            let result = policy.decide(epoch, observation).await;
+            sess.restore_context_policy(policy).await;
+            result?
         } else {
             None
         };
         if let Some(decision) = decision {
-            if decision.action == ContextPolicyAction::Compact {
+            let Some(action) = decision.action else {
+                let mut policy = sess.take_context_policy().await?;
+                let result = policy
+                    .terminal(
+                        sess.next_context_policy_epoch
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                        "planner_emergency_censored",
+                    )
+                    .await;
+                sess.restore_context_policy(policy).await;
+                result?;
+                return Err(CodexErr::InvalidRequest(
+                    "context policy planner emergency: no feasible KEEP/COMPACT action".to_string(),
+                ));
+            };
+            if action == ContextPolicyAction::Compact {
+                // A policy decision can compact immediately before a tool follow-up.
+                // Preserve only the not-yet-consumed tool exchange suffix; older tool
+                // traffic remains represented by the compaction summary.
+                let pending_tool_exchange =
+                    pending_tool_exchange_after_last_assistant(&prompt.input);
                 let Some(initial_context_injection) =
                     context_policy_initial_context_injection.take()
                 else {
@@ -1539,6 +1563,7 @@ async fn run_sampling_request(
                     .clone_history()
                     .await
                     .for_prompt(&step_context.settings.model_info.input_modalities);
+                insert_pending_tool_exchange(&mut post_compact_input, pending_tool_exchange);
                 if let Some(executed_tool_calls) = sess.services.executed_tool_calls.as_ref()
                     && executed_tool_calls.attach_pending_to_prompt(
                         &mut post_compact_input,
@@ -1568,9 +1593,10 @@ async fn run_sampling_request(
                 &turn_context.sub_id,
                 &turn_context.config.model_provider_id,
             );
-            context_policy
-                .record_ready_to_invoke(decision, observation)
-                .await?;
+            let mut policy = sess.take_context_policy().await?;
+            let result = policy.record_ready_to_invoke(decision, observation).await;
+            sess.restore_context_policy(policy).await;
+            result?;
         }
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
@@ -1624,6 +1650,60 @@ async fn run_sampling_request(
         .await?;
         turn_context.turn_timing_state.record_sampling_retry();
     }
+}
+
+fn pending_tool_exchange_after_last_assistant(input: &[ResponseItem]) -> Vec<ResponseItem> {
+    let start = input
+        .iter()
+        .rposition(|item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"))
+        .map_or(0, |index| index.saturating_add(1));
+    input[start..]
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                ResponseItem::LocalShellCall { .. }
+                    | ResponseItem::FunctionCall { .. }
+                    | ResponseItem::ToolSearchCall { .. }
+                    | ResponseItem::FunctionCallOutput { .. }
+                    | ResponseItem::CustomToolCall { .. }
+                    | ResponseItem::CustomToolCallOutput { .. }
+                    | ResponseItem::ToolSearchOutput { .. }
+                    | ResponseItem::WebSearchCall { .. }
+                    | ResponseItem::ImageGenerationCall { .. }
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn insert_pending_tool_exchange(
+    post_compact_input: &mut Vec<ResponseItem>,
+    pending_tool_exchange: Vec<ResponseItem>,
+) {
+    if pending_tool_exchange.is_empty() {
+        return;
+    }
+    let insertion_index = post_compact_input
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, item)| {
+            let is_summary = match item {
+                ResponseItem::Message { content, .. } => content.iter().any(|content| {
+                    matches!(
+                        content,
+                        ContentItem::InputText { text }
+                            if crate::compact::is_summary_message(text)
+                    )
+                }),
+                ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. } => true,
+                _ => false,
+            };
+            is_summary.then_some(index)
+        })
+        .unwrap_or(post_compact_input.len());
+    post_compact_input.splice(insertion_index..insertion_index, pending_tool_exchange);
 }
 
 pub(crate) struct PreparedToolRecommendations {
@@ -2509,6 +2589,9 @@ async fn try_run_sampling_request(
             }
             ResponseEvent::OutputItemDone(mut item) => {
                 assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
+                if let Some(policy) = sess.context_policy.lock().await.as_mut() {
+                    policy.note_normal_output(&item);
+                }
                 if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
                     let call_id = match &item {
                         ResponseItem::FunctionCall { call_id, .. }
