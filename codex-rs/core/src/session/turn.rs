@@ -1678,7 +1678,9 @@ async fn run_sampling_request(
         }
         if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), raw_request.as_ref())
         {
-            ledger.attempt_started(request, attempt_index).await?;
+            // A serve lifecycle keeps one model/provider, so the attempt
+            // identity equals the request identity recorded at begin_request.
+            ledger.attempt_started(request, attempt_index, None).await?;
         }
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
@@ -1704,6 +1706,7 @@ async fn run_sampling_request(
                             output.token_usage.as_ref(),
                             output.visible_output_tokens,
                             output.stop_reason,
+                            None,
                         )
                         .await?;
                 }
@@ -1743,7 +1746,7 @@ async fn run_sampling_request(
         {
             let kind = request_failure_kind(&err);
             ledger
-                .attempt_failed(request, attempt_index, kind, kind)
+                .attempt_failed(request, attempt_index, kind, kind, None)
                 .await?;
         }
 
@@ -1756,7 +1759,7 @@ async fn run_sampling_request(
                 (sess.request_ledger.as_ref(), raw_request.as_ref())
             {
                 let kind = request_failure_kind(&err);
-                ledger.failed(request, kind, kind).await?;
+                ledger.failed(request, kind, kind, None).await?;
             }
             return Err(err);
         }
@@ -1791,7 +1794,7 @@ async fn run_sampling_request(
                     (sess.request_ledger.as_ref(), raw_request.as_ref())
                 {
                     let kind = request_failure_kind(&final_error);
-                    ledger.failed(request, kind, kind).await?;
+                    ledger.failed(request, kind, kind, None).await?;
                 }
                 return Err(final_error);
             }
@@ -1810,9 +1813,9 @@ async fn record_terminal_request_failure(
     if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), request) {
         let kind = request_failure_kind(error);
         ledger
-            .attempt_failed(request, attempt_index, kind, kind)
+            .attempt_failed(request, attempt_index, kind, kind, None)
             .await?;
-        ledger.failed(request, kind, kind).await?;
+        ledger.failed(request, kind, kind, None).await?;
     }
     Ok(())
 }

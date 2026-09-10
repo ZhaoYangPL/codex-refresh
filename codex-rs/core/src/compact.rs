@@ -12,6 +12,7 @@ use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
 use crate::hook_runtime::run_post_compact_hooks;
 use crate::hook_runtime::run_pre_compact_hooks;
+use crate::request_ledger::AttemptIdentity;
 use crate::request_ledger::RawRequestHandle;
 use crate::request_ledger::RequestDescriptor;
 use crate::request_ledger::RequestLinkage;
@@ -294,7 +295,7 @@ async fn run_compact_task_inner_impl(
         if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), raw_request.as_ref())
         {
             ledger
-                .attempt_started(request, request_attempt_index)
+                .attempt_started(request, request_attempt_index, None)
                 .await?;
         }
         // Clone is required because of the loop
@@ -328,6 +329,7 @@ async fn run_compact_task_inner_impl(
                             response.token_usage.as_ref(),
                             Some(response.visible_output_tokens),
                             "completed",
+                            None,
                         )
                         .await?;
                 }
@@ -345,6 +347,7 @@ async fn run_compact_task_inner_impl(
                     request_attempt_index,
                     &err,
                     true,
+                    None,
                 )
                 .await?;
                 return Err(err);
@@ -356,6 +359,7 @@ async fn run_compact_task_inner_impl(
                     request_attempt_index,
                     &e,
                     true,
+                    None,
                 )
                 .await?;
                 sess.track_turn_codex_error(turn_context.as_ref(), &e);
@@ -370,6 +374,7 @@ async fn run_compact_task_inner_impl(
                     request_attempt_index,
                     &e,
                     turn_input_len <= 1,
+                    None,
                 )
                 .await?;
                 if turn_input_len > 1 {
@@ -402,6 +407,7 @@ async fn run_compact_task_inner_impl(
                     request_attempt_index,
                     &e,
                     retries >= max_retries,
+                    None,
                 )
                 .await?;
                 if retries < max_retries {
@@ -544,14 +550,15 @@ pub(crate) async fn record_compaction_request_failure(
     attempt_index: u64,
     error: &CodexErr,
     terminal: bool,
+    identity: Option<&AttemptIdentity>,
 ) -> CodexResult<()> {
     if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), request) {
         let kind = compaction_request_failure_kind(error);
         ledger
-            .attempt_failed(request, attempt_index, kind, kind)
+            .attempt_failed(request, attempt_index, kind, kind, identity)
             .await?;
         if terminal {
-            ledger.failed(request, kind, kind).await?;
+            ledger.failed(request, kind, kind, identity).await?;
         }
     }
     Ok(())

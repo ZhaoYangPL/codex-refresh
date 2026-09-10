@@ -229,7 +229,8 @@ async fn run_remote_compact_task_inner_impl(
     )
     .await?;
     if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), raw_request.as_ref()) {
-        ledger.attempt_started(request, 0).await?;
+        // Attempt 0 runs on the request identity itself, so no override is needed.
+        ledger.attempt_started(request, 0, None).await?;
     }
     let attempt = run_remote_compact_attempt(
         sess,
@@ -251,6 +252,7 @@ async fn run_remote_compact_task_inner_impl(
                 0,
                 &error,
                 !can_fallback,
+                None,
             )
             .await?;
             let Some(fallback_step_context) = fallback_step_context else {
@@ -259,15 +261,24 @@ async fn run_remote_compact_task_inner_impl(
             if !should_retry_with_current_model(&error) {
                 return Err(error);
             }
+            let fallback_turn_context = &fallback_step_context.turn;
+            // The retry runs on another model/provider but stays inside the same
+            // logical compaction lifecycle; record the attempt's own identity so
+            // accounting never attributes it to the original model.
+            let fallback_identity = crate::request_ledger::attempt_identity(
+                fallback_turn_context.provider.info().name.as_str(),
+                fallback_turn_context.model_info().slug.as_str(),
+            );
             if let (Some(ledger), Some(request)) =
                 (sess.request_ledger.as_ref(), raw_request.as_ref())
             {
                 ledger.retry_scheduled(request, 0, 0.0).await?;
-                ledger.attempt_started(request, 1).await?;
+                ledger
+                    .attempt_started(request, 1, Some(&fallback_identity))
+                    .await?;
             }
             sess.set_last_known_step_context(fallback_step_context)
                 .await;
-            let fallback_turn_context = &fallback_step_context.turn;
             let fallback_compaction_trace =
                 sess.services.rollout_thread_trace.compaction_trace_context(
                     fallback_turn_context.sub_id.as_str(),
@@ -301,6 +312,7 @@ async fn run_remote_compact_task_inner_impl(
                         1,
                         &fallback_error,
                         true,
+                        Some(&fallback_identity),
                     )
                     .await?;
                     return Err(error);
@@ -317,6 +329,12 @@ async fn run_remote_compact_task_inner_impl(
             .iter()
             .map(crate::context_policy::visible_output_token_count)
             .sum();
+        // The terminal attempt may have been the fallback one; attribute it to
+        // whichever turn context actually produced the compacted history.
+        let terminal_identity = crate::request_ledger::attempt_identity(
+            compaction_turn_context.provider.info().name.as_str(),
+            compaction_turn_context.model_info().slug.as_str(),
+        );
         ledger
             .completed(
                 request,
@@ -324,6 +342,7 @@ async fn run_remote_compact_task_inner_impl(
                 None,
                 Some(visible_output_tokens),
                 "completed",
+                Some(&terminal_identity),
             )
             .await?;
     }

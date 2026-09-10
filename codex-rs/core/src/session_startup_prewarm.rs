@@ -343,7 +343,9 @@ async fn schedule_startup_prewarm_inner(
         None
     };
     if let (Some(ledger), Some(request)) = (session.request_ledger.as_ref(), raw_request.as_ref()) {
-        ledger.attempt_started(request, 0).await?;
+        // Prewarm is an uncontrolled native path: no optimizer linkage and a
+        // single provider/model, so the attempt identity is the request identity.
+        ledger.attempt_started(request, 0, None).await?;
     }
     let prewarm_result = client_session
         .prewarm_websocket(
@@ -364,7 +366,7 @@ async fn schedule_startup_prewarm_inner(
                 (session.request_ledger.as_ref(), raw_request.as_ref())
             {
                 ledger
-                    .completed(request, None, None, Some(0), "warmup_completed")
+                    .completed(request, None, None, Some(0), "warmup_completed", None)
                     .await?;
             }
         }
@@ -373,8 +375,8 @@ async fn schedule_startup_prewarm_inner(
                 (session.request_ledger.as_ref(), raw_request.as_ref())
             {
                 let kind = compaction_request_failure_kind(&error);
-                ledger.attempt_failed(request, 0, kind, kind).await?;
-                ledger.failed(request, kind, kind).await?;
+                ledger.attempt_failed(request, 0, kind, kind, None).await?;
+                ledger.failed(request, kind, kind, None).await?;
             }
             return Err(error);
         }

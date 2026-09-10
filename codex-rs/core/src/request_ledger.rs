@@ -56,6 +56,53 @@ pub(crate) struct RequestDescriptor<'a> {
     pub(crate) linkage: RequestLinkage,
 }
 
+/// Identity of one attempt when it differs from the logical request identity.
+///
+/// Compaction model fallback retries the same logical compaction lifecycle with
+/// another model/provider.  Recording the attempt's own identity keeps the
+/// fallback from being attributed to the model that happened to create the
+/// `RawRequestHandle`, and lets the accounting layer refuse to price an attempt
+/// whose pricing identity it cannot establish.
+#[derive(Clone, Debug)]
+pub(crate) struct AttemptIdentity {
+    pub(crate) provider_id: String,
+    pub(crate) model_id: String,
+    pub(crate) pricing_schedule_id: Option<String>,
+}
+
+/// Build the attempt identity for a concrete provider/model pair.
+///
+/// Codex has no per-model pricing schedule mapping, so the schedule stays
+/// unknown here; the accounting layer resolves pricing from canonical config or
+/// fixture and fails closed rather than guessing when mixed-model evidence is
+/// insufficient.
+pub(crate) fn attempt_identity(provider_id: &str, model_id: &str) -> AttemptIdentity {
+    AttemptIdentity {
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+        pricing_schedule_id: None,
+    }
+}
+
+fn with_attempt_identity(fields: Value, identity: Option<&AttemptIdentity>) -> Value {
+    let Some(identity) = identity else {
+        return fields;
+    };
+    let Value::Object(mut object) = fields else {
+        return fields;
+    };
+    object.insert(
+        "attempt_provider_id".to_string(),
+        json!(identity.provider_id),
+    );
+    object.insert("attempt_model_id".to_string(), json!(identity.model_id));
+    object.insert(
+        "attempt_pricing_schedule_id".to_string(),
+        json!(identity.pricing_schedule_id),
+    );
+    Value::Object(object)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RawRequestHandle {
     pub(crate) request_index: u64,
@@ -125,16 +172,17 @@ impl RawRequestLedger {
                 "request ledger requires replicate_id",
             )
         })?;
-        let counters = scan_existing(path.as_path(), &run_id)?;
+        let identity = Identity {
+            run_id,
+            task_id,
+            replicate_id,
+            arm: arm_name(config.mode),
+            pricing_schedule_id: config.pricing_schedule_id.clone(),
+        };
+        let counters = scan_existing(path.as_path(), &identity)?;
         Ok(Some(Arc::new(Self {
             path: path.as_path().to_path_buf(),
-            identity: Identity {
-                run_id,
-                task_id,
-                replicate_id,
-                arm: arm_name(config.mode),
-                pricing_schedule_id: config.pricing_schedule_id.clone(),
-            },
+            identity,
             counters: Mutex::new(counters),
             write_order: Semaphore::new(1),
         })))
@@ -184,14 +232,18 @@ impl RawRequestLedger {
         &self,
         handle: &RawRequestHandle,
         attempt_index: u64,
+        identity: Option<&AttemptIdentity>,
     ) -> io::Result<()> {
         self.append(
             handle,
             "attempt_started",
             &format!("attempt:{attempt_index}:start"),
-            json!({
-                "attempt_index": attempt_index,
-            }),
+            with_attempt_identity(
+                json!({
+                    "attempt_index": attempt_index,
+                }),
+                identity,
+            ),
         )
         .await
     }
@@ -202,17 +254,24 @@ impl RawRequestLedger {
         attempt_index: u64,
         failure_kind: &str,
         failure_reason: &str,
+        identity: Option<&AttemptIdentity>,
     ) -> io::Result<()> {
         self.append(
             handle,
             "attempt_failed",
             &format!("attempt:{attempt_index}:failed"),
-            json!({
-                "attempt_index": attempt_index,
-                "failure_kind": failure_kind,
-                "failure_reason": failure_reason,
-                "billable": null,
-            }),
+            with_attempt_identity(
+                json!({
+                    "attempt_index": attempt_index,
+                    "failure_kind": failure_kind,
+                    "failure_reason": failure_reason,
+                    // Codex does not know the provider's billing semantics for a
+                    // failed attempt, so billability stays explicitly unknown
+                    // rather than being guessed as free.
+                    "billable": null,
+                }),
+                identity,
+            ),
         )
         .await
     }
@@ -242,30 +301,34 @@ impl RawRequestLedger {
         usage: Option<&TokenUsage>,
         visible_output_tokens: Option<i64>,
         stop_reason: &str,
+        identity: Option<&AttemptIdentity>,
     ) -> io::Result<()> {
         self.append(
             handle,
             "request_completed",
             "terminal",
-            json!({
-                "response_id": response_id,
-                "provider_usage": usage.map(provider_usage),
-                "usage_provenance": usage.map(|_| json!({
-                    "input_tokens_total": "provider_reported_via_codex_token_usage",
-                    "cache_read_tokens": "codex_normalized_provider_detail_or_default_zero",
-                    "cache_write_tokens": "codex_normalized_provider_detail_or_default_zero",
-                    "uncached_input_tokens": "host_derived_from_codex_normalized_buckets",
-                    "billed_output_tokens": "provider_reported_via_codex_token_usage",
-                    "reasoning_tokens": "codex_normalized_provider_detail_or_default_zero",
-                    "visible_output_tokens": "host_estimated_model_visible_items_v1",
-                })),
-                "input_token_semantics": usage.map(|_| "total_includes_cache"),
-                "visible_output_tokens": visible_output_tokens,
-                "provider_reported_cost": null,
-                "zero_cost_fixture": false,
-                "latency_seconds": handle.started_at.elapsed().as_secs_f64(),
-                "stop_reason": stop_reason,
-            }),
+            with_attempt_identity(
+                json!({
+                    "response_id": response_id,
+                    "provider_usage": usage.map(provider_usage),
+                    "usage_provenance": usage.map(|_| json!({
+                        "input_tokens_total": "provider_reported_via_codex_token_usage",
+                        "cache_read_tokens": "codex_normalized_provider_detail_or_default_zero",
+                        "cache_write_tokens": "codex_normalized_provider_detail_or_default_zero",
+                        "uncached_input_tokens": "host_derived_from_codex_normalized_buckets",
+                        "billed_output_tokens": "provider_reported_via_codex_token_usage",
+                        "reasoning_tokens": "codex_normalized_provider_detail_or_default_zero",
+                        "visible_output_tokens": "host_estimated_model_visible_items_v1",
+                    })),
+                    "input_token_semantics": usage.map(|_| "total_includes_cache"),
+                    "visible_output_tokens": visible_output_tokens,
+                    "provider_reported_cost": null,
+                    "zero_cost_fixture": false,
+                    "latency_seconds": handle.started_at.elapsed().as_secs_f64(),
+                    "stop_reason": stop_reason,
+                }),
+                identity,
+            ),
         )
         .await
     }
@@ -275,21 +338,25 @@ impl RawRequestLedger {
         handle: &RawRequestHandle,
         failure_kind: &str,
         failure_reason: &str,
+        identity: Option<&AttemptIdentity>,
     ) -> io::Result<()> {
         self.append(
             handle,
             "request_failed",
             "terminal",
-            json!({
-                "provider_usage": null,
-                "input_token_semantics": null,
-                "visible_output_tokens": null,
-                "provider_reported_cost": null,
-                "zero_cost_fixture": false,
-                "latency_seconds": handle.started_at.elapsed().as_secs_f64(),
-                "failure_kind": failure_kind,
-                "failure_reason": failure_reason,
-            }),
+            with_attempt_identity(
+                json!({
+                    "provider_usage": null,
+                    "input_token_semantics": null,
+                    "visible_output_tokens": null,
+                    "provider_reported_cost": null,
+                    "zero_cost_fixture": false,
+                    "latency_seconds": handle.started_at.elapsed().as_secs_f64(),
+                    "failure_kind": failure_kind,
+                    "failure_reason": failure_reason,
+                }),
+                identity,
+            ),
         )
         .await
     }
@@ -393,7 +460,7 @@ fn arm_name(mode: ContextPolicyMode) -> &'static str {
     }
 }
 
-fn scan_existing(path: &std::path::Path, run_id: &str) -> io::Result<Counters> {
+fn scan_existing(path: &std::path::Path, identity: &Identity) -> io::Result<Counters> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Counters::default()),
@@ -416,10 +483,40 @@ fn scan_existing(path: &std::path::Path, run_id: &str) -> io::Result<Counters> {
                 "request ledger contains an unsupported schema",
             ));
         }
-        if value.get("run_id").and_then(Value::as_str) != Some(run_id) {
+        // Every field that is frozen for one run must match before new evidence
+        // is appended to an existing stream.  Provider/model identity is
+        // deliberately excluded: a legitimate model fallback may change it
+        // inside one run and belongs to request/attempt identity instead.
+        if value.get("run_id").and_then(Value::as_str) != Some(identity.run_id.as_str()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "request ledger path contains a different run_id",
+            ));
+        }
+        if value.get("task_id").and_then(Value::as_str) != Some(identity.task_id.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request ledger contains a different task_id",
+            ));
+        }
+        if value.get("replicate_id").and_then(Value::as_u64) != Some(identity.replicate_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request ledger contains a different replicate_id",
+            ));
+        }
+        if value.get("arm").and_then(Value::as_str) != Some(identity.arm) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request ledger contains a different arm",
+            ));
+        }
+        if value.get("pricing_schedule_id").and_then(Value::as_str)
+            != identity.pricing_schedule_id.as_deref()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request ledger contains a different pricing_schedule_id",
             ));
         }
         let event_id = value
@@ -495,7 +592,10 @@ mod tests {
             .expect("ledger")
             .expect("enabled");
         let request = ledger.begin_request(descriptor()).await.expect("start");
-        ledger.attempt_started(&request, 0).await.expect("attempt");
+        ledger
+            .attempt_started(&request, 0, None)
+            .await
+            .expect("attempt");
         ledger
             .completed(
                 &request,
@@ -511,6 +611,7 @@ mod tests {
                 }),
                 Some(4),
                 "completed",
+                None,
             )
             .await
             .expect("complete");
@@ -539,18 +640,24 @@ mod tests {
             .expect("ledger")
             .expect("enabled");
         let request = ledger.begin_request(descriptor()).await.expect("start");
-        ledger.attempt_started(&request, 0).await.expect("attempt");
         ledger
-            .attempt_failed(&request, 0, "rate_limit", "429")
+            .attempt_started(&request, 0, None)
+            .await
+            .expect("attempt");
+        ledger
+            .attempt_failed(&request, 0, "rate_limit", "429", None)
             .await
             .expect("failure");
         ledger
             .retry_scheduled(&request, 0, 1.0)
             .await
             .expect("retry");
-        ledger.attempt_started(&request, 1).await.expect("attempt");
         ledger
-            .failed(&request, "provider", "unavailable")
+            .attempt_started(&request, 1, None)
+            .await
+            .expect("attempt");
+        ledger
+            .failed(&request, "provider", "unavailable", None)
             .await
             .expect("terminal");
         drop(ledger);
@@ -574,6 +681,190 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(indices, (0..indices.len() as u64).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn fallback_attempt_records_its_own_provider_and_model_identity() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("requests.raw.jsonl");
+        let ledger = RawRequestLedger::from_config(&config(&path))
+            .expect("ledger")
+            .expect("enabled");
+        let request = ledger.begin_request(descriptor()).await.expect("start");
+        ledger
+            .attempt_started(&request, 0, None)
+            .await
+            .expect("attempt");
+        ledger
+            .attempt_failed(&request, 0, "provider_context_rejection", "overflow", None)
+            .await
+            .expect("failure");
+        // The fallback attempt runs on another model/provider but still belongs
+        // to the same logical compaction lifecycle.
+        let fallback = AttemptIdentity {
+            provider_id: "fallback-provider".into(),
+            model_id: "fallback-model".into(),
+            pricing_schedule_id: None,
+        };
+        ledger
+            .attempt_started(&request, 1, Some(&fallback))
+            .await
+            .expect("fallback attempt");
+        ledger
+            .completed(
+                &request,
+                Some("response"),
+                None,
+                Some(1),
+                "completed",
+                Some(&fallback),
+            )
+            .await
+            .expect("complete");
+        let rows = std::fs::read_to_string(&path)
+            .expect("read")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("json"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 5);
+        // One canonical logical request row: the fallback does not split it.
+        assert!(
+            rows.iter()
+                .all(|row| row["logical_request_id"] == "run:request:0")
+        );
+        assert!(rows.iter().all(|row| row["model_id"] == "fixture-model"));
+        assert!(rows[1].get("attempt_model_id").is_none());
+        assert_eq!(rows[3]["attempt_model_id"], "fallback-model");
+        assert_eq!(rows[3]["attempt_provider_id"], "fallback-provider");
+        assert_eq!(rows[4]["attempt_model_id"], "fallback-model");
+        assert_eq!(rows[4]["attempt_provider_id"], "fallback-provider");
+        assert!(rows[4]["attempt_pricing_schedule_id"].is_null());
+
+        // Resuming with the same identity continues the index sequence.
+        let resumed = RawRequestLedger::from_config(&config(&path))
+            .expect("resume")
+            .expect("enabled");
+        let next = resumed
+            .begin_request(descriptor())
+            .await
+            .expect("next start");
+        assert_eq!(next.request_index, 1);
+    }
+
+    #[test]
+    fn resume_rejects_incompatible_frozen_run_identity() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("requests.raw.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                json!({
+                    "schema_version": RAW_REQUEST_EVENT_SCHEMA_VERSION,
+                    "event_id": "run:request:0:start",
+                    "event_index": 0,
+                    "event": "request_started",
+                    "run_id": "run",
+                    "task_id": "task",
+                    "replicate_id": 4,
+                    "arm": "mpc",
+                    "request_index": 0,
+                    "pricing_schedule_id": "fixture-price-v1",
+                })
+            ),
+        )
+        .expect("write");
+
+        // Same identity resumes and continues indices.
+        let resumed = RawRequestLedger::from_config(&config(&path))
+            .expect("resume")
+            .expect("enabled");
+        drop(resumed);
+
+        let cases: Vec<(&str, ContextPolicyConfig)> = vec![
+            (
+                "task_id",
+                ContextPolicyConfig {
+                    task_id: Some("other-task".into()),
+                    ..config(&path)
+                },
+            ),
+            (
+                "replicate_id",
+                ContextPolicyConfig {
+                    replicate_id: Some(9),
+                    ..config(&path)
+                },
+            ),
+            (
+                "arm",
+                ContextPolicyConfig {
+                    mode: ContextPolicyMode::MpcH1,
+                    ..config(&path)
+                },
+            ),
+            (
+                "pricing_schedule_id",
+                ContextPolicyConfig {
+                    pricing_schedule_id: Some("other-price".into()),
+                    ..config(&path)
+                },
+            ),
+        ];
+        for (name, cfg) in cases {
+            let error = RawRequestLedger::from_config(&cfg)
+                .err()
+                .unwrap_or_else(|| panic!("{name} mismatch must be rejected"));
+            assert!(
+                error.to_string().contains(name),
+                "{name}: unexpected error {error}"
+            );
+        }
+
+        // Raw schema version is frozen for the stream as well.
+        let content = std::fs::read_to_string(&path)
+            .expect("read")
+            .replace(RAW_REQUEST_EVENT_SCHEMA_VERSION, "codex-request-events-v0");
+        std::fs::write(&path, content).expect("write");
+        let error = RawRequestLedger::from_config(&config(&path))
+            .expect_err("schema mismatch must be rejected");
+        assert!(
+            error.to_string().contains("unsupported schema"),
+            "unexpected error {error}"
+        );
+    }
+
+    #[test]
+    fn provider_and_model_may_legitimately_change_within_one_run() {
+        // Frozen run identity deliberately excludes provider/model so a real
+        // fallback does not force a new ledger path.
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("requests.raw.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                json!({
+                    "schema_version": RAW_REQUEST_EVENT_SCHEMA_VERSION,
+                    "event_id": "run:request:0:start",
+                    "event_index": 0,
+                    "event": "request_started",
+                    "run_id": "run",
+                    "task_id": "task",
+                    "replicate_id": 4,
+                    "arm": "mpc",
+                    "request_index": 0,
+                    "provider_id": "other-provider",
+                    "model_id": "other-model",
+                    "pricing_schedule_id": "fixture-price-v1",
+                })
+            ),
+        )
+        .expect("write");
+        let resumed = RawRequestLedger::from_config(&config(&path))
+            .expect("resume")
+            .expect("enabled");
+        drop(resumed);
     }
 
     #[test]

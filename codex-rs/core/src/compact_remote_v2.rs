@@ -23,6 +23,7 @@ use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
 use crate::hook_runtime::run_post_compact_hooks;
 use crate::hook_runtime::run_pre_compact_hooks;
+use crate::request_ledger::AttemptIdentity;
 use crate::request_ledger::RawRequestHandle;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CompactionTurnMetadata;
@@ -258,6 +259,10 @@ async fn run_remote_compact_task_inner_impl(
     )
     .await?;
     let mut next_attempt_index = 0_u64;
+    let initial_identity = crate::request_ledger::attempt_identity(
+        turn_context.provider.info().name.as_str(),
+        turn_context.model_info().slug.as_str(),
+    );
 
     let attempt = run_remote_compact_v2_attempt(
         sess,
@@ -282,6 +287,7 @@ async fn run_remote_compact_task_inner_impl(
                     sess.as_ref(),
                     raw_request.as_ref(),
                     &error,
+                    Some(&initial_identity),
                 )
                 .await?;
             }
@@ -291,6 +297,14 @@ async fn run_remote_compact_task_inner_impl(
             if !should_retry_with_current_model(&error) {
                 return Err(error);
             }
+            let fallback_turn_context = &fallback_step_context.turn;
+            // The fallback attempt belongs to the same logical compaction
+            // lifecycle but runs on another model/provider; keep its own
+            // identity so accounting never attributes it to the initial model.
+            let fallback_identity = crate::request_ledger::attempt_identity(
+                fallback_turn_context.provider.info().name.as_str(),
+                fallback_turn_context.model_info().slug.as_str(),
+            );
             if let (Some(ledger), Some(request)) =
                 (sess.request_ledger.as_ref(), raw_request.as_ref())
             {
@@ -300,7 +314,6 @@ async fn run_remote_compact_task_inner_impl(
             }
             sess.set_last_known_step_context(fallback_step_context)
                 .await;
-            let fallback_turn_context = &fallback_step_context.turn;
             let fallback_compaction_trace =
                 sess.services.rollout_thread_trace.compaction_trace_context(
                     fallback_turn_context.sub_id.as_str(),
@@ -336,6 +349,7 @@ async fn run_remote_compact_task_inner_impl(
                         sess.as_ref(),
                         raw_request.as_ref(),
                         &fallback_error,
+                        Some(&fallback_identity),
                     )
                     .await?;
                     return Err(error);
@@ -355,6 +369,11 @@ async fn run_remote_compact_task_inner_impl(
     if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), raw_request.as_ref()) {
         let visible_output_tokens =
             crate::context_policy::visible_output_token_count(&compaction_output);
+        // Attribute the terminal attempt to whichever step context produced it.
+        let terminal_identity = crate::request_ledger::attempt_identity(
+            compaction_turn_context.provider.info().name.as_str(),
+            compaction_turn_context.model_info().slug.as_str(),
+        );
         ledger
             .completed(
                 request,
@@ -362,6 +381,7 @@ async fn run_remote_compact_task_inner_impl(
                 token_usage.as_ref(),
                 Some(visible_output_tokens),
                 "completed",
+                Some(&terminal_identity),
             )
             .await?;
     }
@@ -447,6 +467,13 @@ async fn run_remote_compaction_request_v2(
     next_attempt_index: &mut u64,
 ) -> CodexResult<RemoteCompactionV2Output> {
     let turn_context = &step_context.turn;
+    // This attempt's own provider/model identity. It may differ from the logical
+    // request identity when a fallback step context is used, so record it
+    // explicitly instead of relying on the request-level fields.
+    let identity = crate::request_ledger::attempt_identity(
+        turn_context.provider.info().name.as_str(),
+        turn_context.model_info().slug.as_str(),
+    );
     let max_retries = turn_context
         .provider
         .info()
@@ -457,7 +484,9 @@ async fn run_remote_compaction_request_v2(
         let attempt_index = *next_attempt_index;
         *next_attempt_index = attempt_index.saturating_add(1);
         if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), raw_request) {
-            ledger.attempt_started(request, attempt_index).await?;
+            ledger
+                .attempt_started(request, attempt_index, Some(&identity))
+                .await?;
         }
         let result = match client_session
             .stream(
@@ -483,13 +512,25 @@ async fn run_remote_compaction_request_v2(
         match result {
             Ok(compaction_output) => return Ok(compaction_output),
             Err(err) if !err.is_retryable() => {
-                record_remote_compaction_attempt_failure(sess, raw_request, attempt_index, &err)
-                    .await?;
+                record_remote_compaction_attempt_failure(
+                    sess,
+                    raw_request,
+                    attempt_index,
+                    &err,
+                    Some(&identity),
+                )
+                .await?;
                 return Err(err);
             }
             Err(err) => {
-                record_remote_compaction_attempt_failure(sess, raw_request, attempt_index, &err)
-                    .await?;
+                record_remote_compaction_attempt_failure(
+                    sess,
+                    raw_request,
+                    attempt_index,
+                    &err,
+                    Some(&identity),
+                )
+                .await?;
                 let retry_started_at = std::time::Instant::now();
                 let retry_result = handle_retryable_response_stream_error(
                     &mut retry_state,
@@ -524,11 +565,12 @@ async fn record_remote_compaction_attempt_failure(
     request: Option<&RawRequestHandle>,
     attempt_index: u64,
     error: &CodexErr,
+    identity: Option<&AttemptIdentity>,
 ) -> CodexResult<()> {
     if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), request) {
         let kind = compaction_request_failure_kind(error);
         ledger
-            .attempt_failed(request, attempt_index, kind, kind)
+            .attempt_failed(request, attempt_index, kind, kind, identity)
             .await?;
     }
     Ok(())
@@ -538,10 +580,11 @@ async fn record_remote_compaction_terminal_failure(
     sess: &Session,
     request: Option<&RawRequestHandle>,
     error: &CodexErr,
+    identity: Option<&AttemptIdentity>,
 ) -> CodexResult<()> {
     if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), request) {
         let kind = compaction_request_failure_kind(error);
-        ledger.failed(request, kind, kind).await?;
+        ledger.failed(request, kind, kind, identity).await?;
     }
     Ok(())
 }
