@@ -8,7 +8,9 @@ use crate::compact::CompactedHistoryMetadata;
 use crate::compact::CompactionAnalyticsAttempt;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::InitialContextInjection;
+use crate::compact::begin_compaction_raw_request;
 use crate::compact::build_compaction_initial_context;
+use crate::compact::compaction_request_failure_kind;
 use crate::compact::compaction_status_from_result;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
 use crate::compact_model_fallback::record_model_fallback;
@@ -21,6 +23,7 @@ use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
 use crate::hook_runtime::run_post_compact_hooks;
 use crate::hook_runtime::run_pre_compact_hooks;
+use crate::request_ledger::RawRequestHandle;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::responses_retry::ResponsesStreamRequest;
@@ -241,6 +244,20 @@ async fn run_remote_compact_task_inner_impl(
     let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
+    let responses_metadata = sess
+        .responses_metadata(
+            turn_context.as_ref(),
+            crate::responses_metadata::CodexResponsesRequestKind::Compaction(compaction_metadata),
+        )
+        .await;
+    let raw_request = begin_compaction_raw_request(
+        sess.as_ref(),
+        turn_context.as_ref(),
+        &responses_metadata,
+        compaction_metadata,
+    )
+    .await?;
+    let mut next_attempt_index = 0_u64;
 
     let attempt = run_remote_compact_v2_attempt(
         sess,
@@ -249,16 +266,37 @@ async fn run_remote_compact_task_inner_impl(
         &compaction_trace,
         compaction_metadata,
         analytics_details,
+        RawCompactionAttemptState {
+            request: raw_request.as_ref(),
+            next_attempt_index: &mut next_attempt_index,
+        },
     )
     .await;
     let (attempt, compaction_turn_context) = match attempt {
         Ok(attempt) => (attempt, turn_context),
         Err(error) => {
+            let can_fallback =
+                fallback_step_context.is_some() && should_retry_with_current_model(&error);
+            if !can_fallback {
+                record_remote_compaction_terminal_failure(
+                    sess.as_ref(),
+                    raw_request.as_ref(),
+                    &error,
+                )
+                .await?;
+            }
             let Some(fallback_step_context) = fallback_step_context else {
                 return Err(error);
             };
             if !should_retry_with_current_model(&error) {
                 return Err(error);
+            }
+            if let (Some(ledger), Some(request)) =
+                (sess.request_ledger.as_ref(), raw_request.as_ref())
+            {
+                ledger
+                    .retry_scheduled(request, next_attempt_index.saturating_sub(1), 0.0)
+                    .await?;
             }
             sess.set_last_known_step_context(fallback_step_context)
                 .await;
@@ -277,6 +315,10 @@ async fn run_remote_compact_task_inner_impl(
                 &fallback_compaction_trace,
                 compaction_metadata,
                 analytics_details,
+                RawCompactionAttemptState {
+                    request: raw_request.as_ref(),
+                    next_attempt_index: &mut next_attempt_index,
+                },
             )
             .await;
             record_model_fallback(
@@ -289,7 +331,15 @@ async fn run_remote_compact_task_inner_impl(
             );
             match fallback_result {
                 Ok(attempt) => (attempt, fallback_turn_context),
-                Err(_) => return Err(error),
+                Err(fallback_error) => {
+                    record_remote_compaction_terminal_failure(
+                        sess.as_ref(),
+                        raw_request.as_ref(),
+                        &fallback_error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
             }
         }
     };
@@ -302,6 +352,19 @@ async fn run_remote_compact_task_inner_impl(
         token_usage,
         owned_client_session: _owned_client_session,
     } = attempt;
+    if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), raw_request.as_ref()) {
+        let visible_output_tokens =
+            crate::context_policy::visible_output_token_count(&compaction_output);
+        ledger
+            .completed(
+                request,
+                Some(&compaction_response_id),
+                token_usage.as_ref(),
+                Some(visible_output_tokens),
+                "completed",
+            )
+            .await?;
+    }
     if let Some(token_usage) = token_usage {
         sess.record_rollout_budget_usage(&token_usage)?;
         analytics_details.active_context_tokens_before = Some(token_usage.input_tokens);
@@ -369,12 +432,19 @@ struct RemoteCompactionV2Output {
     token_usage: Option<TokenUsage>,
 }
 
+struct RawCompactionAttemptState<'a> {
+    request: Option<&'a RawRequestHandle>,
+    next_attempt_index: &'a mut u64,
+}
+
 async fn run_remote_compaction_request_v2(
     sess: &Session,
     step_context: &StepContext,
     client_session: &mut ModelClientSession,
     prompt: &Prompt,
     responses_metadata: &CodexResponsesMetadata,
+    raw_request: Option<&RawRequestHandle>,
+    next_attempt_index: &mut u64,
 ) -> CodexResult<RemoteCompactionV2Output> {
     let turn_context = &step_context.turn;
     let max_retries = turn_context
@@ -384,6 +454,11 @@ async fn run_remote_compaction_request_v2(
         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
     let mut retry_state = ResponsesStreamRetryState::default();
     loop {
+        let attempt_index = *next_attempt_index;
+        *next_attempt_index = attempt_index.saturating_add(1);
+        if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), raw_request) {
+            ledger.attempt_started(request, attempt_index).await?;
+        }
         let result = match client_session
             .stream(
                 prompt,
@@ -407,9 +482,16 @@ async fn run_remote_compaction_request_v2(
 
         match result {
             Ok(compaction_output) => return Ok(compaction_output),
-            Err(err) if !err.is_retryable() => return Err(err),
+            Err(err) if !err.is_retryable() => {
+                record_remote_compaction_attempt_failure(sess, raw_request, attempt_index, &err)
+                    .await?;
+                return Err(err);
+            }
             Err(err) => {
-                handle_retryable_response_stream_error(
+                record_remote_compaction_attempt_failure(sess, raw_request, attempt_index, &err)
+                    .await?;
+                let retry_started_at = std::time::Instant::now();
+                let retry_result = handle_retryable_response_stream_error(
                     &mut retry_state,
                     max_retries,
                     err,
@@ -418,10 +500,50 @@ async fn run_remote_compaction_request_v2(
                     turn_context,
                     ResponsesStreamRequest::RemoteCompactionV2,
                 )
-                .await?;
+                .await;
+                if retry_result.is_ok()
+                    && let (Some(ledger), Some(request)) =
+                        (sess.request_ledger.as_ref(), raw_request)
+                {
+                    ledger
+                        .retry_scheduled(
+                            request,
+                            attempt_index,
+                            retry_started_at.elapsed().as_secs_f64(),
+                        )
+                        .await?;
+                }
+                retry_result?;
             }
         }
     }
+}
+
+async fn record_remote_compaction_attempt_failure(
+    sess: &Session,
+    request: Option<&RawRequestHandle>,
+    attempt_index: u64,
+    error: &CodexErr,
+) -> CodexResult<()> {
+    if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), request) {
+        let kind = compaction_request_failure_kind(error);
+        ledger
+            .attempt_failed(request, attempt_index, kind, kind)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn record_remote_compaction_terminal_failure(
+    sess: &Session,
+    request: Option<&RawRequestHandle>,
+    error: &CodexErr,
+) -> CodexResult<()> {
+    if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), request) {
+        let kind = compaction_request_failure_kind(error);
+        ledger.failed(request, kind, kind).await?;
+    }
+    Ok(())
 }
 
 async fn collect_compaction_output(

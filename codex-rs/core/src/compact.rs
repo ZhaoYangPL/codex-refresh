@@ -12,6 +12,10 @@ use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
 use crate::hook_runtime::run_post_compact_hooks;
 use crate::hook_runtime::run_pre_compact_hooks;
+use crate::request_ledger::RawRequestHandle;
+use crate::request_ledger::RequestDescriptor;
+use crate::request_ledger::RequestLinkage;
+use crate::request_ledger::RequestPurpose;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
@@ -49,6 +53,7 @@ use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
@@ -276,8 +281,22 @@ async fn run_compact_task_inner_impl(
             CodexResponsesRequestKind::Compaction(compaction_metadata),
         )
         .await;
+    let raw_request = begin_compaction_raw_request(
+        &sess,
+        turn_context.as_ref(),
+        &responses_metadata,
+        compaction_metadata,
+    )
+    .await?;
+    let mut request_attempt_index = 0_u64;
 
     let compaction_response_id = loop {
+        if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), raw_request.as_ref())
+        {
+            ledger
+                .attempt_started(request, request_attempt_index)
+                .await?;
+        }
         // Clone is required because of the loop
         let turn_input = history
             .clone()
@@ -298,8 +317,21 @@ async fn run_compact_task_inner_impl(
         .await;
 
         match attempt_result {
-            Ok(response_id) => {
-                break response_id;
+            Ok(response) => {
+                if let (Some(ledger), Some(request)) =
+                    (sess.request_ledger.as_ref(), raw_request.as_ref())
+                {
+                    ledger
+                        .completed(
+                            request,
+                            Some(&response.response_id),
+                            response.token_usage.as_ref(),
+                            Some(response.visible_output_tokens),
+                            "completed",
+                        )
+                        .await?;
+                }
+                break response.response_id;
             }
             Err(err)
                 if matches!(
@@ -307,15 +339,39 @@ async fn run_compact_task_inner_impl(
                     CodexErrorDetails::Interrupted | CodexErrorDetails::TurnAborted
                 ) =>
             {
+                record_compaction_request_failure(
+                    &sess,
+                    raw_request.as_ref(),
+                    request_attempt_index,
+                    &err,
+                    true,
+                )
+                .await?;
                 return Err(err);
             }
             Err(e) if matches!(e.details(), CodexErrorDetails::SessionBudgetExceeded) => {
+                record_compaction_request_failure(
+                    &sess,
+                    raw_request.as_ref(),
+                    request_attempt_index,
+                    &e,
+                    true,
+                )
+                .await?;
                 sess.track_turn_codex_error(turn_context.as_ref(), &e);
                 let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
                 sess.send_event(&turn_context, event).await;
                 return Err(e);
             }
             Err(e) if matches!(e.details(), CodexErrorDetails::ContextWindowExceeded) => {
+                record_compaction_request_failure(
+                    &sess,
+                    raw_request.as_ref(),
+                    request_attempt_index,
+                    &e,
+                    turn_input_len <= 1,
+                )
+                .await?;
                 if turn_input_len > 1 {
                     // Trim from the beginning to preserve cache (prefix-based) and keep recent messages intact.
                     error!(
@@ -323,6 +379,14 @@ async fn run_compact_task_inner_impl(
                     );
                     history.remove_first_item();
                     retries = 0;
+                    if let (Some(ledger), Some(request)) =
+                        (sess.request_ledger.as_ref(), raw_request.as_ref())
+                    {
+                        ledger
+                            .retry_scheduled(request, request_attempt_index, 0.0)
+                            .await?;
+                    }
+                    request_attempt_index += 1;
                     continue;
                 }
                 sess.set_total_tokens_full(turn_context.as_ref()).await;
@@ -332,6 +396,14 @@ async fn run_compact_task_inner_impl(
                 return Err(e);
             }
             Err(e) => {
+                record_compaction_request_failure(
+                    &sess,
+                    raw_request.as_ref(),
+                    request_attempt_index,
+                    &e,
+                    retries >= max_retries,
+                )
+                .await?;
                 if retries < max_retries {
                     retries += 1;
                     let delay = backoff(retries);
@@ -341,7 +413,20 @@ async fn run_compact_task_inner_impl(
                         e,
                     )
                     .await;
+                    let wait_started = Instant::now();
                     tokio::time::sleep(delay).await;
+                    if let (Some(ledger), Some(request)) =
+                        (sess.request_ledger.as_ref(), raw_request.as_ref())
+                    {
+                        ledger
+                            .retry_scheduled(
+                                request,
+                                request_attempt_index,
+                                wait_started.elapsed().as_secs_f64(),
+                            )
+                            .await?;
+                    }
+                    request_attempt_index += 1;
                     continue;
                 } else {
                     sess.track_turn_codex_error(turn_context.as_ref(), &e);
@@ -407,6 +492,79 @@ async fn run_compact_task_inner_impl(
     });
     sess.send_event(&turn_context, warning).await;
     Ok(summary_suffix)
+}
+
+pub(crate) async fn begin_compaction_raw_request(
+    sess: &Session,
+    turn_context: &TurnContext,
+    responses_metadata: &CodexResponsesMetadata,
+    compaction_metadata: CompactionTurnMetadata,
+) -> CodexResult<Option<RawRequestHandle>> {
+    let Some(ledger) = sess.request_ledger.as_ref() else {
+        return Ok(None);
+    };
+    let thread_id = sess.thread_id.to_string();
+    let model_id = turn_context.model_info().slug.clone();
+    let linkage = sess
+        .request_ledger_compaction_linkage
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| RequestLinkage {
+            compaction_kind: Some(
+                if matches!(
+                    compaction_metadata.reason(),
+                    CompactionReason::ModelDownshift
+                ) {
+                    "compatibility"
+                } else {
+                    "system"
+                },
+            ),
+            ..Default::default()
+        });
+    Ok(Some(
+        ledger
+            .begin_request(RequestDescriptor {
+                purpose: RequestPurpose::CompactSummary,
+                thread_id: &thread_id,
+                session_id: Some(&responses_metadata.session_id),
+                turn_id: Some(&turn_context.sub_id),
+                provider_id: &turn_context.config.model_provider_id,
+                model_id: &model_id,
+                linkage,
+            })
+            .await?,
+    ))
+}
+
+pub(crate) async fn record_compaction_request_failure(
+    sess: &Session,
+    request: Option<&RawRequestHandle>,
+    attempt_index: u64,
+    error: &CodexErr,
+    terminal: bool,
+) -> CodexResult<()> {
+    if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), request) {
+        let kind = compaction_request_failure_kind(error);
+        ledger
+            .attempt_failed(request, attempt_index, kind, kind)
+            .await?;
+        if terminal {
+            ledger.failed(request, kind, kind).await?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn compaction_request_failure_kind(error: &CodexErr) -> &'static str {
+    match error.details() {
+        CodexErrorDetails::ContextWindowExceeded => "provider_context_rejection",
+        CodexErrorDetails::UsageLimitReached(_) => "rate_limit",
+        CodexErrorDetails::Interrupted | CodexErrorDetails::TurnAborted => "interrupted",
+        CodexErrorDetails::SessionBudgetExceeded => "session_budget",
+        _ => "provider_or_transport_failure",
+    }
 }
 
 pub(crate) struct CompactionAnalyticsAttempt {
@@ -766,7 +924,8 @@ async fn drain_to_completed(
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
-) -> CodexResult<String> {
+) -> CodexResult<CompactResponse> {
+    let mut visible_output_tokens = 0_i64;
     let mut stream = client_session
         .stream(
             prompt,
@@ -794,6 +953,8 @@ async fn drain_to_completed(
         };
         match event {
             Ok(ResponseEvent::OutputItemDone(item)) => {
+                visible_output_tokens = visible_output_tokens
+                    .saturating_add(crate::context_policy::visible_output_token_count(&item));
                 sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
                     .await;
             }
@@ -818,12 +979,22 @@ async fn drain_to_completed(
                 .await;
                 sess.update_token_usage_info(turn_context, token_usage.as_ref())
                     .await?;
-                return Ok(response_id);
+                return Ok(CompactResponse {
+                    response_id,
+                    token_usage,
+                    visible_output_tokens,
+                });
             }
             Ok(_) => continue,
             Err(e) => return Err(e),
         }
     }
+}
+
+struct CompactResponse {
+    response_id: String,
+    token_usage: Option<TokenUsage>,
+    visible_output_tokens: i64,
 }
 
 #[cfg(test)]

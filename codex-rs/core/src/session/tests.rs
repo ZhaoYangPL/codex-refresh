@@ -6645,6 +6645,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         context_policy: Mutex::new(Some(crate::context_policy::ContextPolicySeam::new(
             Default::default(),
         ))),
+        request_ledger: None,
+        request_ledger_compaction_linkage: Mutex::new(None),
     };
     let per_turn_config =
         session.build_per_turn_config(&session_configuration, session_configuration.cwd().clone());
@@ -8955,6 +8957,8 @@ where
         context_policy: Mutex::new(Some(crate::context_policy::ContextPolicySeam::new(
             Default::default(),
         ))),
+        request_ledger: None,
+        request_ledger_compaction_linkage: Mutex::new(None),
     });
     let per_turn_config =
         session.build_per_turn_config(&session_configuration, session_configuration.cwd().clone());

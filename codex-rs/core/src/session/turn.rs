@@ -31,6 +31,10 @@ use crate::mentions::collect_explicit_app_ids;
 use crate::mentions::collect_explicit_plugin_mentions;
 use crate::mentions::collect_tool_mentions_from_messages;
 use crate::plugins::build_plugin_injections;
+use crate::request_ledger::RawRequestHandle;
+use crate::request_ledger::RequestDescriptor;
+use crate::request_ledger::RequestLinkage;
+use crate::request_ledger::RequestPurpose;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_retry::ResponsesStreamRequest;
@@ -107,6 +111,7 @@ use codex_protocol::protocol::ReasoningContentDeltaEvent;
 use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
 use codex_protocol::protocol::SafetyBufferingEvent;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
@@ -454,6 +459,7 @@ pub(crate) async fn run_turn(
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
+                    ..
                 } = sampling_request_output;
                 if model_needs_follow_up {
                     sess.input_queue
@@ -1463,6 +1469,9 @@ async fn run_sampling_request(
     let mut executed_tool_calls_by_output = HashMap::new();
     let thread_id = sess.thread_id.to_string();
     let mut context_policy_pending = true;
+    let mut request_linkage = RequestLinkage::default();
+    let mut raw_request: Option<RawRequestHandle> = None;
+    let mut attempt_index = 0_u64;
     let mut context_policy_initial_context_injection =
         Some(context_policy_initial_context_injection);
     loop {
@@ -1549,7 +1558,27 @@ async fn run_sampling_request(
                         "controlled policy attempted more than one compaction per sampling invocation",
                     )));
                 };
-                run_auto_compact(
+                let linkage = RequestLinkage {
+                    decision_epoch: Some(decision.epoch),
+                    decision_action: Some(action.as_str()),
+                    compaction_id: Some(format!(
+                        "{}:compact:{}",
+                        sess.request_ledger
+                            .as_ref()
+                            .map_or("unidentified-run", |ledger| ledger.run_id()),
+                        decision.epoch
+                    )),
+                    reset_id: Some(format!(
+                        "{}:reset:{}",
+                        sess.request_ledger
+                            .as_ref()
+                            .map_or("unidentified-run", |ledger| ledger.run_id()),
+                        decision.epoch
+                    )),
+                    compaction_kind: Some("policy"),
+                };
+                *sess.request_ledger_compaction_linkage.lock().await = Some(linkage.clone());
+                let compact_result = run_auto_compact(
                     &sess,
                     Arc::clone(&step_context),
                     /*fallback_step_context*/ None,
@@ -1558,7 +1587,9 @@ async fn run_sampling_request(
                     CompactionReason::ContextLimit,
                     CompactionPhase::MidTurn,
                 )
-                .await?;
+                .await;
+                *sess.request_ledger_compaction_linkage.lock().await = None;
+                compact_result?;
                 let mut post_compact_input = sess
                     .clone_history()
                     .await
@@ -1580,6 +1611,29 @@ async fn run_sampling_request(
                     base_instructions.clone(),
                 );
             }
+            request_linkage = RequestLinkage {
+                decision_epoch: Some(decision.epoch),
+                decision_action: Some(action.as_str()),
+                compaction_id: (action == ContextPolicyAction::Compact).then(|| {
+                    format!(
+                        "{}:compact:{}",
+                        sess.request_ledger
+                            .as_ref()
+                            .map_or("unidentified-run", |ledger| ledger.run_id()),
+                        decision.epoch
+                    )
+                }),
+                reset_id: (action == ContextPolicyAction::Compact).then(|| {
+                    format!(
+                        "{}:reset:{}",
+                        sess.request_ledger
+                            .as_ref()
+                            .map_or("unidentified-run", |ledger| ledger.run_id()),
+                        decision.epoch
+                    )
+                }),
+                ..Default::default()
+            };
             let model_visible_request = client_session.model_visible_context_snapshot(
                 &prompt,
                 &step_context.settings.model_info,
@@ -1598,6 +1652,34 @@ async fn run_sampling_request(
             sess.restore_context_policy(policy).await;
             result?;
         }
+        if raw_request.is_none()
+            && let Some(ledger) = sess.request_ledger.as_ref()
+        {
+            raw_request = Some(
+                ledger
+                    .begin_request(RequestDescriptor {
+                        purpose: if matches!(
+                            turn_context.session_source,
+                            SessionSource::Internal(InternalSessionSource::MemoryConsolidation)
+                        ) {
+                            RequestPurpose::Memory
+                        } else {
+                            RequestPurpose::Serve
+                        },
+                        thread_id: &thread_id,
+                        session_id: Some(&responses_metadata.session_id),
+                        turn_id: Some(&turn_context.sub_id),
+                        provider_id: &turn_context.config.model_provider_id,
+                        model_id: &step_context.settings.model_info.slug,
+                        linkage: request_linkage.clone(),
+                    })
+                    .await?,
+            );
+        }
+        if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), raw_request.as_ref())
+        {
+            ledger.attempt_started(request, attempt_index).await?;
+        }
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
@@ -1612,14 +1694,41 @@ async fn run_sampling_request(
         .await
         {
             Ok(output) => {
+                if let (Some(ledger), Some(request)) =
+                    (sess.request_ledger.as_ref(), raw_request.as_ref())
+                {
+                    ledger
+                        .completed(
+                            request,
+                            output.response_id.as_deref(),
+                            output.token_usage.as_ref(),
+                            output.visible_output_tokens,
+                            output.stop_reason,
+                        )
+                        .await?;
+                }
                 return Ok((output, original_input.unwrap_or(prompt.input)));
             }
             Err(err) => match err.details() {
                 CodexErrorDetails::ContextWindowExceeded => {
+                    record_terminal_request_failure(
+                        &sess,
+                        raw_request.as_ref(),
+                        attempt_index,
+                        &err,
+                    )
+                    .await?;
                     sess.set_total_tokens_full(&turn_context).await;
                     return Err(err);
                 }
                 CodexErrorDetails::UsageLimitReached(e) => {
+                    record_terminal_request_failure(
+                        &sess,
+                        raw_request.as_ref(),
+                        attempt_index,
+                        &err,
+                    )
+                    .await?;
                     let rate_limits = e.rate_limits.clone();
                     if let Some(rate_limits) = rate_limits {
                         sess.update_rate_limits(&turn_context, *rate_limits).await;
@@ -1630,15 +1739,30 @@ async fn run_sampling_request(
             },
         };
 
+        if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), raw_request.as_ref())
+        {
+            let kind = request_failure_kind(&err);
+            ledger
+                .attempt_failed(request, attempt_index, kind, kind)
+                .await?;
+        }
+
         if original_input.is_none() {
             original_input = Some(prompt.input);
         }
 
         if !err.is_retryable() {
+            if let (Some(ledger), Some(request)) =
+                (sess.request_ledger.as_ref(), raw_request.as_ref())
+            {
+                let kind = request_failure_kind(&err);
+                ledger.failed(request, kind, kind).await?;
+            }
             return Err(err);
         }
 
-        handle_retryable_response_stream_error(
+        let retry_wait_started = std::time::Instant::now();
+        let retry_result = handle_retryable_response_stream_error(
             &mut retry_state,
             max_retries,
             err,
@@ -1647,8 +1771,59 @@ async fn run_sampling_request(
             &turn_context,
             ResponsesStreamRequest::Sampling,
         )
-        .await?;
+        .await;
+        match retry_result {
+            Ok(()) => {
+                if let (Some(ledger), Some(request)) =
+                    (sess.request_ledger.as_ref(), raw_request.as_ref())
+                {
+                    ledger
+                        .retry_scheduled(
+                            request,
+                            attempt_index,
+                            retry_wait_started.elapsed().as_secs_f64(),
+                        )
+                        .await?;
+                }
+            }
+            Err(final_error) => {
+                if let (Some(ledger), Some(request)) =
+                    (sess.request_ledger.as_ref(), raw_request.as_ref())
+                {
+                    let kind = request_failure_kind(&final_error);
+                    ledger.failed(request, kind, kind).await?;
+                }
+                return Err(final_error);
+            }
+        }
+        attempt_index += 1;
         turn_context.turn_timing_state.record_sampling_retry();
+    }
+}
+
+async fn record_terminal_request_failure(
+    sess: &Session,
+    request: Option<&RawRequestHandle>,
+    attempt_index: u64,
+    error: &CodexErr,
+) -> CodexResult<()> {
+    if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), request) {
+        let kind = request_failure_kind(error);
+        ledger
+            .attempt_failed(request, attempt_index, kind, kind)
+            .await?;
+        ledger.failed(request, kind, kind).await?;
+    }
+    Ok(())
+}
+
+fn request_failure_kind(error: &CodexErr) -> &'static str {
+    match error.details() {
+        CodexErrorDetails::ContextWindowExceeded => "provider_context_rejection",
+        CodexErrorDetails::UsageLimitReached(_) => "rate_limit",
+        CodexErrorDetails::Interrupted | CodexErrorDetails::TurnAborted => "interrupted",
+        CodexErrorDetails::SessionBudgetExceeded => "session_budget",
+        _ => "provider_or_transport_failure",
     }
 }
 
@@ -1846,6 +2021,10 @@ pub(crate) async fn built_tools(
 struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
+    response_id: Option<String>,
+    token_usage: Option<TokenUsage>,
+    visible_output_tokens: Option<i64>,
+    stop_reason: &'static str,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -2510,6 +2689,7 @@ async fn try_run_sampling_request(
     let mut in_flight: FuturesOrdered<InFlightFuture<'static>> = FuturesOrdered::new();
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
+    let mut visible_output_tokens = 0_i64;
     let mut active_item: Option<TurnItem> = None;
     let mut active_tool_argument_diff_consumer: Option<(
         String,
@@ -2589,6 +2769,8 @@ async fn try_run_sampling_request(
             }
             ResponseEvent::OutputItemDone(mut item) => {
                 assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
+                visible_output_tokens = visible_output_tokens
+                    .saturating_add(crate::context_policy::visible_output_token_count(&item));
                 if let Some(policy) = sess.context_policy.lock().await.as_mut() {
                     policy.note_normal_output(&item);
                 }
@@ -2699,6 +2881,10 @@ async fn try_run_sampling_request(
                     break Ok(SamplingRequestResult {
                         needs_follow_up: true,
                         last_agent_message,
+                        response_id: None,
+                        token_usage: None,
+                        visible_output_tokens: Some(visible_output_tokens),
+                        stop_reason: "host_preempted_for_mailbox",
                     });
                 }
             }
@@ -2879,6 +3065,10 @@ async fn try_run_sampling_request(
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
+                    response_id: Some(response_id),
+                    token_usage,
+                    visible_output_tokens: Some(visible_output_tokens),
+                    stop_reason: "completed",
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {

@@ -185,4 +185,28 @@ fn controlled_configuration_is_fail_closed() {
         ..Default::default()
     };
     assert!(validate_config(&missing_identity, /*token_budget_enabled*/ false).is_err());
+
+    let request_log_without_identity = ContextPolicyConfig {
+        request_raw_log_path: controlled.raw_log_path,
+        ..Default::default()
+    };
+    assert!(
+        validate_config(
+            &request_log_without_identity,
+            /*token_budget_enabled*/ false
+        )
+        .is_err()
+    );
+
+    let schedule_without_request_log = ContextPolicyConfig {
+        pricing_schedule_id: Some("fixture-price-v1".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        validate_config(
+            &schedule_without_request_log,
+            /*token_budget_enabled*/ false
+        )
+        .is_err()
+    );
 }

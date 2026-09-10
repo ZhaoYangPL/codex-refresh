@@ -32,6 +32,15 @@ pub(crate) enum ContextPolicyAction {
     Compact,
 }
 
+impl ContextPolicyAction {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Keep => "KEEP",
+            Self::Compact => "COMPACT",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContextPolicyDecision {
     pub(crate) epoch: u64,
@@ -117,6 +126,18 @@ pub(crate) fn validate_config(
     token_budget_enabled: bool,
 ) -> io::Result<()> {
     let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+    if config.request_raw_log_path.is_some()
+        && (config.run_id.as_deref().is_none_or(str::is_empty)
+            || config.task_id.as_deref().is_none_or(str::is_empty)
+            || config.replicate_id.is_none())
+    {
+        return Err(invalid(
+            "request_raw_log_path requires run_id, task_id, and replicate_id",
+        ));
+    }
+    if config.pricing_schedule_id.is_some() && config.request_raw_log_path.is_none() {
+        return Err(invalid("pricing_schedule_id requires request_raw_log_path"));
+    }
     if config.mode == ContextPolicyMode::NativeFixed {
         return Ok(());
     }
@@ -225,23 +246,9 @@ impl ContextPolicySeam {
     /// Accumulate only model-visible output from a normal serving response.
     /// Compaction-summary streams use a separate path and never call this method.
     pub(crate) fn note_normal_output(&mut self, item: &ResponseItem) {
-        let visible_assistant_output = matches!(
-            item,
-            ResponseItem::Message { role, .. } if role == "assistant"
-        ) || matches!(
-            item,
-            ResponseItem::FunctionCall { .. }
-                | ResponseItem::CustomToolCall { .. }
-                | ResponseItem::ToolSearchCall { .. }
-                | ResponseItem::LocalShellCall { .. }
-                | ResponseItem::WebSearchCall { .. }
-                | ResponseItem::ImageGenerationCall { .. }
-        );
-        if visible_assistant_output {
-            self.pending_output_tokens = self
-                .pending_output_tokens
-                .saturating_add(estimate_item_token_count(item));
-        }
+        self.pending_output_tokens = self
+            .pending_output_tokens
+            .saturating_add(visible_output_token_count(item));
     }
 
     /// Track non-model additions for final intervals that have no next request
@@ -605,6 +612,26 @@ impl ContextPolicySeam {
             log.flush().await?;
         }
         Ok(())
+    }
+}
+
+pub(crate) fn visible_output_token_count(item: &ResponseItem) -> i64 {
+    let visible_assistant_output = matches!(
+        item,
+        ResponseItem::Message { role, .. } if role == "assistant"
+    ) || matches!(
+        item,
+        ResponseItem::FunctionCall { .. }
+            | ResponseItem::CustomToolCall { .. }
+            | ResponseItem::ToolSearchCall { .. }
+            | ResponseItem::LocalShellCall { .. }
+            | ResponseItem::WebSearchCall { .. }
+            | ResponseItem::ImageGenerationCall { .. }
+    );
+    if visible_assistant_output {
+        estimate_item_token_count(item)
+    } else {
+        0
     }
 }
 

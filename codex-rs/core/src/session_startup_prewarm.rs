@@ -12,7 +12,11 @@ use tracing::trace_span;
 use tracing::warn;
 
 use crate::client::ModelClientSession;
+use crate::compact::compaction_request_failure_kind;
 use crate::guardian::routes_approval_to_guardian;
+use crate::request_ledger::RequestDescriptor;
+use crate::request_ledger::RequestLinkage;
+use crate::request_ledger::RequestPurpose;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::INITIAL_SUBMIT_ID;
 use crate::session::RequestEffortUsage;
@@ -320,7 +324,28 @@ async fn schedule_startup_prewarm_inner(
     let mut client_session = session.services.model_client.new_session();
     let websocket_warmup_started_at = Instant::now();
     // Prewarm establishes the request baseline before the first turn can change effort.
-    client_session
+    let thread_id = session.thread_id.to_string();
+    let raw_request = if let Some(ledger) = session.request_ledger.as_ref() {
+        Some(
+            ledger
+                .begin_request(RequestDescriptor {
+                    purpose: RequestPurpose::Prewarm,
+                    thread_id: &thread_id,
+                    session_id: Some(&responses_metadata.session_id),
+                    turn_id: Some(&startup_turn_context.sub_id),
+                    provider_id: &startup_turn_context.config.model_provider_id,
+                    model_id: &step_context.settings.model_info.slug,
+                    linkage: RequestLinkage::default(),
+                })
+                .await?,
+        )
+    } else {
+        None
+    };
+    if let (Some(ledger), Some(request)) = (session.request_ledger.as_ref(), raw_request.as_ref()) {
+        ledger.attempt_started(request, 0).await?;
+    }
+    let prewarm_result = client_session
         .prewarm_websocket(
             &startup_prompt,
             &step_context.settings.model_info,
@@ -332,7 +357,28 @@ async fn schedule_startup_prewarm_inner(
             step_context.settings.service_tier.clone(),
             &responses_metadata,
         )
-        .await?;
+        .await;
+    match prewarm_result {
+        Ok(()) => {
+            if let (Some(ledger), Some(request)) =
+                (session.request_ledger.as_ref(), raw_request.as_ref())
+            {
+                ledger
+                    .completed(request, None, None, Some(0), "warmup_completed")
+                    .await?;
+            }
+        }
+        Err(error) => {
+            if let (Some(ledger), Some(request)) =
+                (session.request_ledger.as_ref(), raw_request.as_ref())
+            {
+                let kind = compaction_request_failure_kind(&error);
+                ledger.attempt_failed(request, 0, kind, kind).await?;
+                ledger.failed(request, kind, kind).await?;
+            }
+            return Err(error);
+        }
+    }
     startup_turn_context.session_telemetry.record_startup_phase(
         "startup_prewarm_websocket_warmup",
         websocket_warmup_started_at.elapsed(),

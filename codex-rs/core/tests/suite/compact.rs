@@ -308,6 +308,14 @@ fn read_policy_records(path: &Path) -> Vec<Value> {
         .collect()
 }
 
+fn read_request_records(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .expect("read raw request ledger")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse raw request JSONL"))
+        .collect()
+}
+
 fn python_hook_command(script_path: &Path) -> String {
     format!("python3 \"{}\"", script_path.display())
 }
@@ -1950,6 +1958,9 @@ async fn controlled_policy_decides_once_before_each_tool_follow_up_invocation() 
     let policy_path = policy_dir.path().join("tool-follow-up.jsonl");
     let policy_path_absolute = AbsolutePathBuf::from_absolute_path(&policy_path)
         .expect("policy log path should be absolute");
+    let request_path = policy_dir.path().join("tool-follow-up-requests.jsonl");
+    let request_path_absolute = AbsolutePathBuf::from_absolute_path(&request_path)
+        .expect("request log path should be absolute");
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
@@ -1959,8 +1970,11 @@ async fn controlled_policy_decides_once_before_each_tool_follow_up_invocation() 
             .features
             .disable(Feature::TokenBudget)
             .expect("disable TokenBudget");
-        config.experimental_context_policy =
+        let mut policy =
             controlled_policy_config(ContextPolicyMode::ExternalStub, policy_path_absolute);
+        policy.request_raw_log_path = Some(request_path_absolute);
+        policy.pricing_schedule_id = Some("fixture-price-v1".to_string());
+        config.experimental_context_policy = policy;
     });
     let codex = builder
         .build(&server)
@@ -2025,6 +2039,20 @@ async fn controlled_policy_decides_once_before_each_tool_follow_up_invocation() 
             .contains(second_call_id),
         "the second decision snapshot must include the second tool result"
     );
+    let request_records = read_request_records(&request_path);
+    assert_eq!(
+        request_records
+            .iter()
+            .filter(|record| record["event"] == "request_started")
+            .count(),
+        2,
+        "tool events must not fabricate provider requests"
+    );
+    assert!(
+        request_records
+            .iter()
+            .all(|record| record["request_purpose"] == "serve")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2043,6 +2071,9 @@ async fn controlled_policy_decides_once_across_a_stream_retry() {
     let policy_path = policy_dir.path().join("stream-retry.jsonl");
     let policy_path_absolute = AbsolutePathBuf::from_absolute_path(&policy_path)
         .expect("policy log path should be absolute");
+    let request_path = policy_dir.path().join("stream-retry-requests.jsonl");
+    let request_path_absolute = AbsolutePathBuf::from_absolute_path(&request_path)
+        .expect("request log path should be absolute");
     let mut model_provider = non_openai_model_provider(&server);
     model_provider.request_max_retries = Some(0);
     model_provider.stream_max_retries = Some(1);
@@ -2052,8 +2083,10 @@ async fn controlled_policy_decides_once_across_a_stream_retry() {
             .features
             .disable(Feature::TokenBudget)
             .expect("disable TokenBudget");
-        config.experimental_context_policy =
+        let mut policy =
             controlled_policy_config(ContextPolicyMode::ExternalStub, policy_path_absolute);
+        policy.request_raw_log_path = Some(request_path_absolute);
+        config.experimental_context_policy = policy;
     });
     let codex = builder
         .build(&server)
@@ -2091,6 +2124,26 @@ async fn controlled_policy_decides_once_across_a_stream_retry() {
             .count(),
         1,
     );
+    let request_records = read_request_records(&request_path);
+    let logical_ids = request_records
+        .iter()
+        .map(|record| record["logical_request_id"].as_str().expect("logical id"))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(logical_ids.len(), 1, "retry must stay one logical request");
+    assert_eq!(
+        request_records
+            .iter()
+            .filter(|record| record["event"] == "attempt_started")
+            .count(),
+        2
+    );
+    assert_eq!(
+        request_records
+            .iter()
+            .filter(|record| record["event"] == "retry_scheduled")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2118,6 +2171,11 @@ async fn tool_results_survive_policy_compact_before_follow_up_invocation() {
     let policy_path = policy_dir.path().join("tool-compact-follow-up.jsonl");
     let policy_path_absolute = AbsolutePathBuf::from_absolute_path(&policy_path)
         .expect("policy log path should be absolute");
+    let request_path = policy_dir
+        .path()
+        .join("tool-compact-follow-up-requests.jsonl");
+    let request_path_absolute = AbsolutePathBuf::from_absolute_path(&request_path)
+        .expect("request log path should be absolute");
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
@@ -2130,6 +2188,7 @@ async fn tool_results_survive_policy_compact_before_follow_up_invocation() {
             controlled_policy_config(ContextPolicyMode::ExternalStub, policy_path_absolute);
         policy.external_stub = Some(ExternalContextPolicyStub::CompactAtEpoch);
         policy.external_stub_compact_at_epoch = Some(1);
+        policy.request_raw_log_path = Some(request_path_absolute);
         config.experimental_context_policy = policy;
     });
     let codex = builder
@@ -2169,6 +2228,23 @@ async fn tool_results_survive_policy_compact_before_follow_up_invocation() {
         .collect::<Vec<_>>();
     assert_eq!(decisions.len(), 2, "summary request is not a policy epoch");
     assert_eq!(decisions[1]["action"], "COMPACT");
+    let starts = read_request_records(&request_path)
+        .into_iter()
+        .filter(|record| record["event"] == "request_started")
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 3);
+    assert_eq!(
+        starts
+            .iter()
+            .map(|record| record["request_purpose"].as_str().expect("purpose"))
+            .collect::<Vec<_>>(),
+        vec!["serve", "compact_summary", "serve"]
+    );
+    assert_eq!(starts[1]["decision_epoch"], 1);
+    assert_eq!(starts[1]["decision_action"], "COMPACT");
+    assert_eq!(starts[1]["compaction_kind"], "policy");
+    assert_eq!(starts[1]["compaction_id"], "phase8a-test-run:compact:1");
+    assert_eq!(starts[1]["reset_id"], "phase8a-test-run:reset:1");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2375,8 +2451,13 @@ async fn planner_emergency_after_a_real_interval_is_a_distinct_censored_terminal
     let raw_log_path = policy_dir.path().join("planner-emergency-policy.jsonl");
     let raw_log_path = AbsolutePathBuf::from_absolute_path(&raw_log_path)
         .expect("policy log path should be absolute");
-    let (policy, protocol_log) =
+    let (mut policy, protocol_log) =
         persistent_bridge_fixture(&policy_dir, raw_log_path, "emergency_after_first");
+    let request_path = policy_dir.path().join("planner-emergency-requests.jsonl");
+    policy.request_raw_log_path = Some(
+        AbsolutePathBuf::from_absolute_path(&request_path)
+            .expect("request log path should be absolute"),
+    );
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
@@ -2424,6 +2505,15 @@ async fn planner_emergency_after_a_real_interval_is_a_distinct_censored_terminal
         ]
     );
     assert_eq!(events[4]["reason"], "planner_emergency_censored");
+    let request_records = read_request_records(&request_path);
+    assert_eq!(
+        request_records
+            .iter()
+            .filter(|record| record["event"] == "request_started")
+            .count(),
+        1,
+        "actionless emergency must not fabricate a second request"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3761,6 +3851,10 @@ async fn pre_sampling_legacy_remote_compact_falls_back_after_previous_model_inva
         ],
     )
     .await;
+    let ledger_dir = TempDir::new().expect("create request ledger directory");
+    let raw_request_path = ledger_dir.path().join("legacy-remote-requests.raw.jsonl");
+    let raw_request_path_absolute = AbsolutePathBuf::from_absolute_path(&raw_request_path)
+        .expect("request ledger path should be absolute");
 
     let model_provider = openai_model_provider(&server);
     let mut builder = test_codex()
@@ -3770,6 +3864,11 @@ async fn pre_sampling_legacy_remote_compact_falls_back_after_previous_model_inva
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
             let _ = config.features.disable(Feature::RemoteCompactionV2);
+            config.experimental_context_policy.run_id = Some("legacy-remote-run".to_string());
+            config.experimental_context_policy.task_id = Some("legacy-remote-task".to_string());
+            config.experimental_context_policy.replicate_id = Some(0);
+            config.experimental_context_policy.request_raw_log_path =
+                Some(raw_request_path_absolute);
         });
     let test = builder.build(&server).await.expect("build test codex");
 
@@ -3801,6 +3900,26 @@ async fn pre_sampling_legacy_remote_compact_falls_back_after_previous_model_inva
     assert_eq!(models_mock.requests().len(), 1);
     assert_eq!(requests.len(), 2);
     assert_eq!(compact_requests.len(), 2);
+    let raw_records = read_request_records(&raw_request_path);
+    let starts = raw_records
+        .iter()
+        .filter(|record| record["event"] == "request_started")
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 3);
+    assert_eq!(starts[0]["request_purpose"], "serve");
+    assert_eq!(starts[1]["request_purpose"], "compact_summary");
+    assert_eq!(starts[2]["request_purpose"], "serve");
+    let summary_id = starts[1]["logical_request_id"].clone();
+    assert_eq!(
+        raw_records
+            .iter()
+            .filter(|record| {
+                record["logical_request_id"] == summary_id && record["event"] == "attempt_started"
+            })
+            .count(),
+        2,
+        "legacy endpoint model fallback remains one logical summary lifecycle"
+    );
     assert_eq!(
         requests[0].body_json()["model"].as_str(),
         Some(retired_model)
@@ -6271,6 +6390,8 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     )
     .await;
     let home = Arc::new(TempDir::new()?);
+    let raw_request_path = home.path().join("remote-v2-requests.raw.jsonl");
+    let raw_request_path_absolute = AbsolutePathBuf::from_absolute_path(&raw_request_path)?;
     let source = write_global_file(
         home.as_ref(),
         GLOBAL_AGENTS_FILENAME,
@@ -6279,8 +6400,16 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     let mut builder = test_codex()
         .with_home(Arc::clone(&home))
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_config(|config| {
-            let _ = config.features.enable(Feature::RemoteCompactionV2);
+        .with_config({
+            let raw_request_path_absolute = raw_request_path_absolute.clone();
+            move |config| {
+                let _ = config.features.enable(Feature::RemoteCompactionV2);
+                config.experimental_context_policy.run_id = Some("remote-v2-run".to_string());
+                config.experimental_context_policy.task_id = Some("remote-v2-task".to_string());
+                config.experimental_context_policy.replicate_id = Some(0);
+                config.experimental_context_policy.request_raw_log_path =
+                    Some(raw_request_path_absolute);
+            }
         });
     let test = builder.build(&server).await?;
 
@@ -6304,6 +6433,14 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     // creation-time item despite the file-backed source now containing new text.
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 3);
+    let raw_request_starts = read_request_records(&raw_request_path)
+        .into_iter()
+        .filter(|record| record["event"] == "request_started")
+        .collect::<Vec<_>>();
+    assert_eq!(raw_request_starts.len(), 3);
+    assert_eq!(raw_request_starts[0]["request_purpose"], "serve");
+    assert_eq!(raw_request_starts[1]["request_purpose"], "compact_summary");
+    assert_eq!(raw_request_starts[2]["request_purpose"], "serve");
     let old_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
     assert_single_instruction_fragment(&requests[0], &old_fragment);
     assert_single_instruction_fragment(&requests[1], &old_fragment);
@@ -6341,9 +6478,17 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     let mut resume_builder = test_codex()
         .with_home(Arc::clone(&home))
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_config(move |config| {
-            config.cwd = resumed_cwd;
-            let _ = config.features.enable(Feature::RemoteCompactionV2);
+        .with_config({
+            let raw_request_path_absolute = raw_request_path_absolute.clone();
+            move |config| {
+                config.cwd = resumed_cwd;
+                let _ = config.features.enable(Feature::RemoteCompactionV2);
+                config.experimental_context_policy.run_id = Some("remote-v2-run".to_string());
+                config.experimental_context_policy.task_id = Some("remote-v2-task".to_string());
+                config.experimental_context_policy.replicate_id = Some(0);
+                config.experimental_context_policy.request_raw_log_path =
+                    Some(raw_request_path_absolute);
+            }
         });
     let resumed = resume_builder
         .resume(&server, Arc::clone(&home), rollout_path)
@@ -6356,6 +6501,16 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     // an explicit replacement.
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 4);
+    let raw_request_starts = read_request_records(&raw_request_path)
+        .into_iter()
+        .filter(|record| record["event"] == "request_started")
+        .collect::<Vec<_>>();
+    assert_eq!(raw_request_starts.len(), 4);
+    assert_eq!(raw_request_starts[3]["request_index"], 3);
+    assert_eq!(
+        raw_request_starts[3]["logical_request_id"],
+        "remote-v2-run:request:3"
+    );
     let replacement_fragment = expected_instruction_fragment(&format!(
         "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{NEW_GLOBAL_INSTRUCTIONS}"
     ));

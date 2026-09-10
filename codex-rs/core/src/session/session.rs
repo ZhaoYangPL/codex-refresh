@@ -80,6 +80,11 @@ pub(crate) struct Session {
     pub(super) next_context_policy_epoch: AtomicU64,
     /// One policy/bridge lifecycle for the entire controlled session trajectory.
     pub(super) context_policy: Mutex<Option<crate::context_policy::ContextPolicySeam>>,
+    /// Optional append-only raw request evidence stream for Phase 8C.
+    pub(crate) request_ledger: Option<Arc<crate::request_ledger::RawRequestLedger>>,
+    /// Only populated while a policy-selected COMPACT is issuing its summary request.
+    pub(crate) request_ledger_compaction_linkage:
+        Mutex<Option<crate::request_ledger::RequestLinkage>>,
 }
 
 #[derive(Clone)]
@@ -1565,6 +1570,10 @@ impl Session {
                         config.experimental_context_policy.clone(),
                     ),
                 )),
+                request_ledger: crate::request_ledger::RawRequestLedger::from_config(
+                    &config.experimental_context_policy,
+                )?,
+                request_ledger_compaction_linkage: Mutex::new(None),
             });
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;

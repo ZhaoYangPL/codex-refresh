@@ -97,6 +97,10 @@ pub struct ContextPolicyConfig {
     pub task_id: Option<String>,
     pub replicate_id: Option<u64>,
     pub raw_log_path: Option<AbsolutePathBuf>,
+    /// Append-only Phase 8C provider-request lifecycle event log.
+    pub request_raw_log_path: Option<AbsolutePathBuf>,
+    /// Frozen schedule selected by the research artifact manifest, if any.
+    pub pricing_schedule_id: Option<String>,
     pub bridge_command: Option<AbsolutePathBuf>,
     pub bridge_args: Vec<String>,
     pub bridge_working_directory: Option<AbsolutePathBuf>,
@@ -118,6 +122,8 @@ impl Default for ContextPolicyConfig {
             task_id: None,
             replicate_id: None,
             raw_log_path: None,
+            request_raw_log_path: None,
+            pricing_schedule_id: None,
             bridge_command: None,
             bridge_args: Vec::new(),
             bridge_working_directory: None,

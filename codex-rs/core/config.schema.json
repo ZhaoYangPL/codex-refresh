@@ -1227,6 +1227,11 @@
           ],
           "default": "native_fixed"
         },
+        "pricing_schedule_id": {
+          "default": null,
+          "description": "Frozen schedule selected by the research artifact manifest, if any.",
+          "type": "string"
+        },
         "raw_log_path": {
           "allOf": [
             {
@@ -1244,6 +1249,15 @@
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "request_raw_log_path": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "default": null,
+          "description": "Append-only Phase 8C provider-request lifecycle event log."
         },
         "run_id": {
           "default": null,
