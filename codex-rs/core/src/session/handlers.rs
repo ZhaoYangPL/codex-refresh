@@ -399,7 +399,10 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
     }
 }
 
-pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>, terminal_reason: &str) {
+pub(super) async fn shutdown_session_runtime(
+    sess: &Arc<Session>,
+    terminal_reason: &str,
+) -> std::io::Result<()> {
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
@@ -416,9 +419,6 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>, terminal_reaso
         }
         Err(err) => Err(err),
     };
-    if let Err(err) = terminal_result {
-        warn!("failed to terminate context policy trajectory: {err}");
-    }
     let shell_snapshot_prewarm = sess.state.lock().await.shell_snapshot_prewarm.take();
     if let Some(shell_snapshot_prewarm) = shell_snapshot_prewarm {
         shell_snapshot_prewarm.abort();
@@ -443,6 +443,7 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>, terminal_reaso
     sess.guardian_review_session().shutdown().await;
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
+    terminal_result
 }
 
 pub(super) async fn emit_thread_stop_lifecycle(sess: &Session) {
@@ -457,7 +458,7 @@ pub(super) async fn emit_thread_stop_lifecycle(sess: &Session) {
 }
 
 pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
-    shutdown_session_runtime(sess, "natural_complete").await;
+    let policy_terminal_result = shutdown_session_runtime(sess, "natural_complete").await;
     info!("Shutting down Codex instance");
     let history = sess.clone_history().await;
     let turn_count = history
@@ -489,9 +490,25 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         sess.send_event_raw(event).await;
     }
 
-    let event = Event {
-        id: sub_id,
-        msg: EventMsg::ShutdownComplete,
+    let (event, rollout_status) = match policy_terminal_result {
+        Ok(()) => (
+            Event {
+                id: sub_id,
+                msg: EventMsg::ShutdownComplete,
+            },
+            codex_rollout_trace::RolloutStatus::Completed,
+        ),
+        Err(error) => (
+            Event {
+                id: sub_id,
+                msg: EventMsg::Error(ErrorEvent {
+                    misalignment: None,
+                    message: format!("Failed to finalize context policy trajectory: {error}"),
+                    codex_error_info: Some(CodexErrorInfo::Other),
+                }),
+            },
+            codex_rollout_trace::RolloutStatus::Failed,
+        ),
     };
     sess.services
         .rollout_thread_trace
@@ -499,7 +516,7 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
     sess.deliver_event_raw(event).await;
     sess.services
         .rollout_thread_trace
-        .record_ended(codex_rollout_trace::RolloutStatus::Completed);
+        .record_ended(rollout_status);
     true
 }
 
@@ -742,7 +759,9 @@ pub(super) async fn submission_loop(
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {
-        shutdown_session_runtime(&sess, "user_abort_censored").await;
+        if let Err(err) = shutdown_session_runtime(&sess, "user_abort_censored").await {
+            warn!("failed to finalize aborted context policy trajectory: {err}");
+        }
         emit_thread_stop_lifecycle(sess.as_ref()).await;
         if let Some(live_thread) = sess.live_thread()
             && let Err(err) = live_thread.shutdown().await

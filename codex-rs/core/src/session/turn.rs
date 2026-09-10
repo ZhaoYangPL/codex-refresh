@@ -1527,14 +1527,13 @@ async fn run_sampling_request(
                     .terminal(
                         sess.next_context_policy_epoch
                             .load(std::sync::atomic::Ordering::SeqCst),
-                        "natural_task_failure",
+                        "planner_emergency_censored",
                     )
                     .await;
                 sess.restore_context_policy(policy).await;
                 result?;
                 return Err(CodexErr::InvalidRequest(
-                    "context policy planner emergency: no feasible KEEP/COMPACT action"
-                        .to_string(),
+                    "context policy planner emergency: no feasible KEEP/COMPACT action".to_string(),
                 ));
             };
             if action == ContextPolicyAction::Compact {
@@ -1564,10 +1563,7 @@ async fn run_sampling_request(
                     .clone_history()
                     .await
                     .for_prompt(&step_context.settings.model_info.input_modalities);
-                insert_pending_tool_exchange(
-                    &mut post_compact_input,
-                    pending_tool_exchange,
-                );
+                insert_pending_tool_exchange(&mut post_compact_input, pending_tool_exchange);
                 if let Some(executed_tool_calls) = sess.services.executed_tool_calls.as_ref()
                     && executed_tool_calls.attach_pending_to_prompt(
                         &mut post_compact_input,
@@ -1659,9 +1655,7 @@ async fn run_sampling_request(
 fn pending_tool_exchange_after_last_assistant(input: &[ResponseItem]) -> Vec<ResponseItem> {
     let start = input
         .iter()
-        .rposition(|item| {
-            matches!(item, ResponseItem::Message { role, .. } if role == "assistant")
-        })
+        .rposition(|item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"))
         .map_or(0, |index| index.saturating_add(1));
     input[start..]
         .iter()

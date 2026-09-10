@@ -41,7 +41,9 @@ impl ContextPolicyBridge {
             command.current_dir(directory.as_path());
         }
         let mut child = command.spawn().map_err(|error| {
-            io::Error::other(format!("context policy infrastructure failure: spawn: {error}"))
+            io::Error::other(format!(
+                "context policy infrastructure failure: spawn: {error}"
+            ))
         })?;
         let stdin = child
             .stdin
@@ -101,7 +103,9 @@ impl ContextPolicyBridge {
             "epoch",
         ] {
             if response.get(field) != request.get(field) {
-                return Err(infrastructure(format!("response identity mismatch: {field}")));
+                return Err(infrastructure(format!(
+                    "response identity mismatch: {field}"
+                )));
             }
         }
         Ok(response)
@@ -124,7 +128,10 @@ fn invalid(message: impl Into<String>) -> io::Error {
 }
 
 fn infrastructure(message: impl Into<String>) -> io::Error {
-    io::Error::other(format!("context policy infrastructure failure: {}", message.into()))
+    io::Error::other(format!(
+        "context policy infrastructure failure: {}",
+        message.into()
+    ))
 }
 
 #[cfg(test)]

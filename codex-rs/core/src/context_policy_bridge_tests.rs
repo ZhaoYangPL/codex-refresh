@@ -2,10 +2,12 @@ use std::path::Path;
 
 use codex_config::types::ContextPolicyConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 use tempfile::TempDir;
 
-use super::{ContextPolicyBridge, PROTOCOL_VERSION};
+use super::ContextPolicyBridge;
+use super::PROTOCOL_VERSION;
 
 fn absolute(path: &Path) -> AbsolutePathBuf {
     AbsolutePathBuf::from_absolute_path(path).expect("test path is absolute")
@@ -94,8 +96,8 @@ fn protocol_version_is_phase8b_v1() {
 async fn rust_starts_child_and_exchanges_h1_and_full_decisions() {
     for mode in ["mpc_h1", "mpc"] {
         let directory = TempDir::new().expect("temp dir");
-        let mut bridge = ContextPolicyBridge::spawn(&config(&directory, "ok", 2_000))
-            .expect("spawn bridge");
+        let mut bridge =
+            ContextPolicyBridge::spawn(&config(&directory, "ok", 2_000)).expect("spawn bridge");
         let mut initialize = request("initialize", "init", 0);
         initialize["controller_mode"] = json!(mode);
         let initialized = bridge.exchange(&initialize).await.expect("handshake");
@@ -111,9 +113,12 @@ async fn rust_starts_child_and_exchanges_h1_and_full_decisions() {
 #[tokio::test]
 async fn one_child_preserves_multiple_exchange_epochs() {
     let directory = TempDir::new().expect("temp dir");
-    let mut bridge = ContextPolicyBridge::spawn(&config(&directory, "ok", 2_000))
-        .expect("spawn bridge");
-    bridge.exchange(&request("initialize", "init", 0)).await.expect("handshake");
+    let mut bridge =
+        ContextPolicyBridge::spawn(&config(&directory, "ok", 2_000)).expect("spawn bridge");
+    bridge
+        .exchange(&request("initialize", "init", 0))
+        .await
+        .expect("handshake");
     assert!(bridge.exchange(&request("decide", "d0", 0)).await.is_ok());
     assert!(bridge.exchange(&request("decide", "d1", 1)).await.is_ok());
 }
@@ -127,9 +132,11 @@ async fn malformed_identity_and_protocol_responses_fail_closed() {
         ("protocol", "identity mismatch: protocol_version"),
     ] {
         let directory = TempDir::new().expect("temp dir");
-        let mut bridge = ContextPolicyBridge::spawn(&config(&directory, behavior, 2_000))
-            .expect("spawn bridge");
-        let error = bridge.exchange(&request("initialize", "init", 0)).await
+        let mut bridge =
+            ContextPolicyBridge::spawn(&config(&directory, behavior, 2_000)).expect("spawn bridge");
+        let error = bridge
+            .exchange(&request("initialize", "init", 0))
+            .await
             .expect_err("bad response must fail");
         assert!(error.to_string().contains(expected), "{error}");
     }
@@ -144,7 +151,9 @@ async fn child_exit_and_timeout_are_infrastructure_failures() {
         let directory = TempDir::new().expect("temp dir");
         let mut bridge = ContextPolicyBridge::spawn(&config(&directory, behavior, timeout))
             .expect("spawn bridge");
-        let error = bridge.exchange(&request("initialize", "init", 0)).await
+        let error = bridge
+            .exchange(&request("initialize", "init", 0))
+            .await
             .expect_err("process failure must fail closed");
         assert!(error.to_string().contains(expected), "{error}");
         assert!(error.to_string().contains("infrastructure failure"));

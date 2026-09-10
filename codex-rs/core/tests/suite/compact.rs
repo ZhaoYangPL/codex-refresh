@@ -226,6 +226,7 @@ fn controlled_compact_at_epoch_zero(raw_log_path: AbsolutePathBuf) -> ContextPol
 fn persistent_bridge_fixture(
     directory: &TempDir,
     raw_log_path: AbsolutePathBuf,
+    behavior: &str,
 ) -> (ContextPolicyConfig, PathBuf) {
     let script_path = directory.path().join("persistent_bridge.py");
     let protocol_log = directory.path().join("bridge-protocol.jsonl");
@@ -235,10 +236,12 @@ fn persistent_bridge_fixture(
 import sys
 
 log_path = sys.argv[1]
+behavior = sys.argv[2]
 for line in sys.stdin:
     request = json.loads(line)
     with open(log_path, "a", encoding="utf-8") as stream:
-        stream.write(json.dumps({"type": request["type"], "epoch": request["epoch"]}) + "\n")
+        stream.write(json.dumps({"type": request["type"], "epoch": request["epoch"],
+                                 "reason": request.get("reason")}) + "\n")
     response = {key: request[key] for key in (
         "protocol_version", "request_id", "run_id", "task_id",
         "replicate_id", "thread_id", "epoch")}
@@ -246,12 +249,16 @@ for line in sys.stdin:
     if kind == "initialize":
         response.update(type="initialized", controller_mode=request["controller_mode"])
     elif kind == "decide":
-        response.update(type="decision", action="KEEP", decision_mode="monetary",
-                        q_keep=1.0, q_compact=2.0, predicted_post_compact_L=None)
+        if behavior == "emergency_after_first" and request["epoch"] > 0:
+            response.update(type="decision", action=None, decision_mode="emergency",
+                            q_keep=None, q_compact=None, predicted_post_compact_L=None)
+        else:
+            response.update(type="decision", action="KEEP", decision_mode="monetary",
+                            q_keep=1.0, q_compact=2.0, predicted_post_compact_L=None)
     elif kind == "observe_transition":
         response.update(type="transition_observed")
     elif kind == "terminal":
-        response.update(type="terminated")
+        response.update(type="unexpected" if behavior == "terminal_failure" else "terminated")
     elif kind == "shutdown":
         response.update(type="shutdown_complete")
     print(json.dumps(response, separators=(",", ":")), flush=True)
@@ -281,6 +288,7 @@ for line in sys.stdin:
         bridge_args: vec![
             script_path.to_string_lossy().into_owned(),
             protocol_log.to_string_lossy().into_owned(),
+            behavior.to_string(),
         ],
         bridge_timeout_ms: Some(2_000),
         controller_config_id: Some("fixture-controller-v1".to_string()),
@@ -2047,7 +2055,11 @@ async fn controlled_policy_decides_once_across_a_stream_retry() {
         config.experimental_context_policy =
             controlled_policy_config(ContextPolicyMode::ExternalStub, policy_path_absolute);
     });
-    let codex = builder.build(&server).await.expect("build test codex").codex;
+    let codex = builder
+        .build(&server)
+        .await
+        .expect("build test codex")
+        .codex;
 
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -2058,7 +2070,11 @@ async fn controlled_policy_decides_once_across_a_stream_retry() {
         .expect("submit user turn");
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
-    assert_eq!(request_log.requests().len(), 2, "one transport retry expected");
+    assert_eq!(
+        request_log.requests().len(),
+        2,
+        "one transport retry expected"
+    );
     let records = read_policy_records(&policy_path);
     assert_eq!(
         records
@@ -2096,8 +2112,7 @@ async fn tool_results_survive_policy_compact_before_follow_up_invocation() {
         ev_assistant_message("m-final", FINAL_REPLY),
         ev_completed_with_tokens("r-final", /*total_tokens*/ 10),
     ]);
-    let request_log =
-        mount_sse_sequence(&server, vec![first_turn, compact_turn, follow_up]).await;
+    let request_log = mount_sse_sequence(&server, vec![first_turn, compact_turn, follow_up]).await;
 
     let policy_dir = TempDir::new().expect("create policy log directory");
     let policy_path = policy_dir.path().join("tool-compact-follow-up.jsonl");
@@ -2117,7 +2132,11 @@ async fn tool_results_survive_policy_compact_before_follow_up_invocation() {
         policy.external_stub_compact_at_epoch = Some(1);
         config.experimental_context_policy = policy;
     });
-    let codex = builder.build(&server).await.expect("build test codex").codex;
+    let codex = builder
+        .build(&server)
+        .await
+        .expect("build test codex")
+        .codex;
 
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -2129,7 +2148,11 @@ async fn tool_results_survive_policy_compact_before_follow_up_invocation() {
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     let requests = request_log.requests();
-    assert_eq!(requests.len(), 3, "model, compact, and rebuilt serve expected");
+    assert_eq!(
+        requests.len(),
+        3,
+        "model, compact, and rebuilt serve expected"
+    );
     assert!(body_contains_text(
         &requests[1].body_json().to_string(),
         SUMMARIZATION_PROMPT
@@ -2235,7 +2258,7 @@ async fn mpc_bridge_and_estimator_trajectory_persist_across_host_turns() {
     let raw_log_path = policy_dir.path().join("persistent-policy.jsonl");
     let raw_log_path = AbsolutePathBuf::from_absolute_path(&raw_log_path)
         .expect("policy log path should be absolute");
-    let (policy, protocol_log) = persistent_bridge_fixture(&policy_dir, raw_log_path);
+    let (policy, protocol_log) = persistent_bridge_fixture(&policy_dir, raw_log_path, "ok");
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
@@ -2253,8 +2276,14 @@ async fn mpc_bridge_and_estimator_trajectory_persist_across_host_turns() {
     test.submit_text_turn("second MPC host turn")
         .await
         .expect("submit second turn");
-    test.codex.submit(Op::Shutdown).await.expect("shutdown session");
-    wait_for_event(&test.codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    test.codex
+        .submit(Op::Shutdown)
+        .await
+        .expect("shutdown session");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
 
     assert_eq!(request_log.requests().len(), 2);
     let protocol = fs::read_to_string(protocol_log).expect("read bridge protocol log");
@@ -2279,6 +2308,122 @@ async fn mpc_bridge_and_estimator_trajectory_persist_across_host_turns() {
     assert_eq!(events[1]["epoch"], 0);
     assert_eq!(events[2]["epoch"], 1);
     assert_eq!(events[3]["epoch"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_finalization_failure_is_reported_instead_of_shutdown_success() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("m-terminal-failure", FINAL_REPLY),
+            ev_completed_with_tokens("r-terminal-failure", 10),
+        ]),
+    )
+    .await;
+    let policy_dir = TempDir::new().expect("create policy fixture directory");
+    let raw_log_path = policy_dir.path().join("terminal-failure-policy.jsonl");
+    let raw_log_path = AbsolutePathBuf::from_absolute_path(&raw_log_path)
+        .expect("policy log path should be absolute");
+    let (policy, _) = persistent_bridge_fixture(&policy_dir, raw_log_path, "terminal_failure");
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        config.experimental_context_policy = policy;
+    });
+    let test = builder.build(&server).await.expect("build test codex");
+
+    test.submit_text_turn("terminal failure fixture")
+        .await
+        .expect("submit turn");
+    test.codex
+        .submit(Op::Shutdown)
+        .await
+        .expect("submit shutdown");
+    let EventMsg::Error(error) =
+        wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await
+    else {
+        unreachable!("predicate guarantees an error event");
+    };
+    assert!(
+        error
+            .message
+            .contains("Failed to finalize context policy trajectory")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn planner_emergency_after_a_real_interval_is_a_distinct_censored_terminal() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let request_log = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("m-before-emergency", FIRST_REPLY),
+            ev_completed_with_tokens("r-before-emergency", 10),
+        ]),
+    )
+    .await;
+    let policy_dir = TempDir::new().expect("create policy fixture directory");
+    let raw_log_path = policy_dir.path().join("planner-emergency-policy.jsonl");
+    let raw_log_path = AbsolutePathBuf::from_absolute_path(&raw_log_path)
+        .expect("policy log path should be absolute");
+    let (policy, protocol_log) =
+        persistent_bridge_fixture(&policy_dir, raw_log_path, "emergency_after_first");
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        config.experimental_context_policy = policy;
+    });
+    let test = builder.build(&server).await.expect("build test codex");
+
+    test.submit_text_turn("successful epoch before emergency")
+        .await
+        .expect("submit first turn");
+    test.submit_text_turn("planner emergency epoch")
+        .await
+        .expect("submit emergency turn");
+    test.codex
+        .submit(Op::Shutdown)
+        .await
+        .expect("shutdown session");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    assert_eq!(request_log.requests().len(), 1);
+    let protocol = fs::read_to_string(protocol_log).expect("read bridge protocol log");
+    let events = protocol
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("valid fixture record"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().expect("event type"))
+            .collect::<Vec<_>>(),
+        vec![
+            "initialize",
+            "decide",
+            "observe_transition",
+            "decide",
+            "terminal",
+            "shutdown",
+        ]
+    );
+    assert_eq!(events[4]["reason"], "planner_emergency_censored");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

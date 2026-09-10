@@ -2,18 +2,22 @@
 
 use std::io;
 
-use codex_config::types::{ContextPolicyConfig, ContextPolicyMode, ExternalContextPolicyStub};
-use codex_protocol::openai_models::ModelInfo;
+use codex_config::types::ContextPolicyConfig;
+use codex_config::types::ContextPolicyMode;
+use codex_config::types::ExternalContextPolicyStub;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelInfo;
 use codex_utils_cache::sha1_digest;
 use codex_utils_string::approx_token_count;
 use serde_json::Value;
-use tokio::fs::{File, OpenOptions};
+use tokio::fs::File;
+use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
 use crate::Prompt;
 use crate::context_manager::estimate_item_token_count;
-use crate::context_policy_bridge::{ContextPolicyBridge, PROTOCOL_VERSION};
+use crate::context_policy_bridge::ContextPolicyBridge;
+use crate::context_policy_bridge::PROTOCOL_VERSION;
 
 const PHASE8A_PROTOCOL_VERSION: &str = "phase8a-v1";
 const L_KIND: &str = "codex_model_visible_components_v1";
@@ -137,7 +141,9 @@ pub(crate) fn validate_config(
                 return Err(invalid("controlled_fixed requires fixed_threshold_tokens"));
             }
             if config.external_stub.is_some() {
-                return Err(invalid("controlled_fixed cannot include external stub settings"));
+                return Err(invalid(
+                    "controlled_fixed cannot include external stub settings",
+                ));
             }
         }
         ContextPolicyMode::ExternalStub => match config.external_stub {
@@ -145,7 +151,11 @@ pub(crate) fn validate_config(
                 if config.external_stub_compact_at_epoch.is_none() => {}
             Some(ExternalContextPolicyStub::CompactAtEpoch)
                 if config.external_stub_compact_at_epoch.is_some() => {}
-            _ => return Err(invalid("external_stub settings are incomplete or inconsistent")),
+            _ => {
+                return Err(invalid(
+                    "external_stub settings are incomplete or inconsistent",
+                ));
+            }
         },
         ContextPolicyMode::MpcH1 | ContextPolicyMode::Mpc => {
             let identities = [
@@ -156,7 +166,9 @@ pub(crate) fn validate_config(
             if config.bridge_command.is_none()
                 || config.seed.is_none()
                 || config.bridge_timeout_ms.is_none_or(|value| value == 0)
-                || identities.into_iter().any(|value| value.is_none_or(str::is_empty))
+                || identities
+                    .into_iter()
+                    .any(|value| value.is_none_or(str::is_empty))
                 || config.z_schema_version.as_deref() != Some(Z_SCHEMA_VERSION)
             {
                 return Err(invalid("MPC bridge configuration is incomplete"));
@@ -261,7 +273,10 @@ impl ContextPolicySeam {
     }
 
     fn is_mpc(&self) -> bool {
-        matches!(self.config.mode, ContextPolicyMode::MpcH1 | ContextPolicyMode::Mpc)
+        matches!(
+            self.config.mode,
+            ContextPolicyMode::MpcH1 | ContextPolicyMode::Mpc
+        )
     }
 
     pub(crate) async fn decide(
@@ -276,13 +291,15 @@ impl ContextPolicySeam {
         let (action, predicted, decision_mode) = match self.config.mode {
             ContextPolicyMode::NativeFixed => unreachable!(),
             ContextPolicyMode::ControlledFixed => (
-                Some(if observation.formal_input_tokens
-                    >= self.config.fixed_threshold_tokens.unwrap_or(i64::MAX)
-                {
-                    ContextPolicyAction::Compact
-                } else {
-                    ContextPolicyAction::Keep
-                }),
+                Some(
+                    if observation.formal_input_tokens
+                        >= self.config.fixed_threshold_tokens.unwrap_or(i64::MAX)
+                    {
+                        ContextPolicyAction::Compact
+                    } else {
+                        ContextPolicyAction::Keep
+                    },
+                ),
                 None,
                 "fixed_threshold".to_string(),
             ),
@@ -358,9 +375,7 @@ impl ContextPolicySeam {
                 }}),
             );
             let response = self.exchange(&request).await?;
-            if response.get("type").and_then(Value::as_str)
-                != Some("compact_feedback_accepted")
-            {
+            if response.get("type").and_then(Value::as_str) != Some("compact_feedback_accepted") {
                 return Err(infrastructure("compact feedback was not accepted"));
             }
         }
@@ -401,12 +416,7 @@ impl ContextPolicySeam {
                 "measurement_kind": L_KIND,
             });
         }
-        let request = self.message(
-            "terminal",
-            epoch,
-            &observation,
-            body,
-        );
+        let request = self.message("terminal", epoch, &observation, body);
         let response = self.exchange(&request).await?;
         if response.get("type").and_then(Value::as_str) != Some("terminated") {
             return Err(infrastructure("terminal was not accepted"));
@@ -534,7 +544,12 @@ impl ContextPolicySeam {
             .await
     }
 
-    fn record(&self, event: &str, decision: &ContextPolicyDecision, observation: &ContextPolicyObservation) -> Value {
+    fn record(
+        &self,
+        event: &str,
+        decision: &ContextPolicyDecision,
+        observation: &ContextPolicyObservation,
+    ) -> Value {
         serde_json::json!({"event": event,
             "protocol_version": if self.is_mpc() { PROTOCOL_VERSION } else { PHASE8A_PROTOCOL_VERSION },
             "run_id": self.run_id(), "task_id": self.task_id(), "replicate_id": self.replicate_id(),
@@ -558,15 +573,30 @@ impl ContextPolicySeam {
             "model_visible_request": observation.model_visible_request})
     }
 
-    fn run_id(&self) -> &str { self.config.run_id.as_deref().unwrap_or_default() }
-    fn task_id(&self) -> &str { self.config.task_id.as_deref().unwrap_or_default() }
-    fn replicate_id(&self) -> u64 { self.config.replicate_id.unwrap_or_default() }
+    fn run_id(&self) -> &str {
+        self.config.run_id.as_deref().unwrap_or_default()
+    }
+    fn task_id(&self) -> &str {
+        self.config.task_id.as_deref().unwrap_or_default()
+    }
+    fn replicate_id(&self) -> u64 {
+        self.config.replicate_id.unwrap_or_default()
+    }
 
     async fn append(&mut self, record: &Value) -> io::Result<()> {
         if self.log.is_none() {
-            let path = self.config.raw_log_path.as_ref()
+            let path = self
+                .config
+                .raw_log_path
+                .as_ref()
                 .ok_or_else(|| io::Error::other("controlled policy log path is missing"))?;
-            self.log = Some(OpenOptions::new().create(true).append(true).open(path.as_path()).await?);
+            self.log = Some(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path.as_path())
+                    .await?,
+            );
         }
         let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
         line.push(b'\n');
@@ -579,27 +609,47 @@ impl ContextPolicySeam {
 }
 
 fn formal_request_tokens(prompt: &Prompt) -> i64 {
-    let base = i64::try_from(approx_token_count(&prompt.base_instructions.text)).unwrap_or(i64::MAX);
-    let input = prompt.input.iter().map(estimate_item_token_count).fold(0_i64, i64::saturating_add);
+    let base =
+        i64::try_from(approx_token_count(&prompt.base_instructions.text)).unwrap_or(i64::MAX);
+    let input = prompt
+        .input
+        .iter()
+        .map(estimate_item_token_count)
+        .fold(0_i64, i64::saturating_add);
     let tools = serde_json::to_string(&prompt.tools)
         .map(|value| i64::try_from(approx_token_count(&value)).unwrap_or(i64::MAX))
         .unwrap_or(i64::MAX);
-    let output = prompt.output_schema.as_ref().and_then(|schema| serde_json::to_string(schema).ok())
-        .map_or(0, |value| i64::try_from(approx_token_count(&value)).unwrap_or(i64::MAX));
-    base.saturating_add(input).saturating_add(tools).saturating_add(output)
+    let output = prompt
+        .output_schema
+        .as_ref()
+        .and_then(|schema| serde_json::to_string(schema).ok())
+        .map_or(0, |value| {
+            i64::try_from(approx_token_count(&value)).unwrap_or(i64::MAX)
+        });
+    base.saturating_add(input)
+        .saturating_add(tools)
+        .saturating_add(output)
 }
 
 fn floor_utf8_boundary(bytes: &[u8], mut index: usize) -> usize {
-    while index > 0 && std::str::from_utf8(&bytes[..index]).is_err() { index -= 1; }
+    while index > 0 && std::str::from_utf8(&bytes[..index]).is_err() {
+        index -= 1;
+    }
     index
 }
 
 fn hex_sha1(bytes: &[u8]) -> String {
-    sha1_digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+    sha1_digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn infrastructure(message: impl Into<String>) -> io::Error {
-    io::Error::other(format!("context policy infrastructure failure: {}", message.into()))
+    io::Error::other(format!(
+        "context policy infrastructure failure: {}",
+        message.into()
+    ))
 }
 
 fn parse_bridge_decision(
@@ -610,7 +660,10 @@ fn parse_bridge_decision(
         .and_then(Value::as_str)
         .ok_or_else(|| infrastructure("decision_mode is missing"))?
         .to_string();
-    let action = match (mode.as_str(), response.get("action").and_then(Value::as_str)) {
+    let action = match (
+        mode.as_str(),
+        response.get("action").and_then(Value::as_str),
+    ) {
         ("emergency", None) => None,
         (_, Some("KEEP")) => Some(ContextPolicyAction::Keep),
         (_, Some("COMPACT")) => Some(ContextPolicyAction::Compact),
