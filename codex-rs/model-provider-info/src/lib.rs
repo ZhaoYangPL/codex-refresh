@@ -119,6 +119,12 @@ pub struct ModelProviderInfo {
     pub wire_api: WireApi,
     /// Optional query parameters to append to the base URL.
     pub query_params: Option<HashMap<String, RedactedString>>,
+    /// Static end-user identifier sent as the Responses `user` body field.
+    ///
+    /// Some providers use it for KV-cache and scheduling isolation, so one
+    /// stable value per experiment arm keeps within-arm cache reuse real while
+    /// keeping arms from sharing cached prefixes. Unset omits the field.
+    pub user_id: Option<String>,
     /// Additional HTTP headers to include in requests to this provider where
     /// the (key, value) pairs are the header name and value.
     pub http_headers: Option<HashMap<String, RedactedString>>,
@@ -393,6 +399,7 @@ impl ModelProviderInfo {
             auth: None,
             aws: None,
             wire_api: WireApi::Responses,
+            user_id: None,
             query_params: None,
             http_headers: Some(
                 [("version".to_string(), env!("CARGO_PKG_VERSION").into())]
@@ -440,6 +447,7 @@ impl ModelProviderInfo {
                 auth_refresh: None,
             })),
             wire_api: WireApi::Responses,
+            user_id: None,
             query_params: None,
             http_headers: Some(HashMap::from([(
                 AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER.to_string(),
@@ -619,6 +627,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         auth: None,
         aws: None,
         wire_api,
+        user_id: None,
         query_params: None,
         http_headers: None,
         env_http_headers: None,

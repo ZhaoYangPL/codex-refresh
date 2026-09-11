@@ -940,6 +940,7 @@ mod tests {
     #[test]
     fn direct_serialization_preserves_websocket_request_payload() {
         let api_request = ResponsesApiRequest {
+            user: None,
             model: "gpt-test".to_string(),
             instructions: "Use the available tools.".to_string(),
             input: vec![ResponseItem::Message {

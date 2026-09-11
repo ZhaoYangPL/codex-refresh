@@ -1305,6 +1305,13 @@
           "type": "string"
         },
         {
+          "description": "Invoke the accepted TCP / adaptive-accumulator baseline through the Phase 8B bridge.\n\nSits between the fixed threshold and the MPC arm in the formal timing ladder.  It shares the bridge, the compact-feedback exchange, and the formal L/K/W observation path with the MPC arms, but it is not an MPC mode: it uses no horizon, no scenario sampling, and no recovery model.",
+          "enum": [
+            "tcp_accumulator"
+          ],
+          "type": "string"
+        },
+        {
           "description": "Invoke the accepted controller through the Phase 8B bridge with H=1.",
           "enum": [
             "mpc_h1"
@@ -2484,6 +2491,10 @@
           "default": false,
           "description": "Whether this provider supports the Responses API WebSocket transport.",
           "type": "boolean"
+        },
+        "user_id": {
+          "description": "Static end-user identifier sent as the Responses `user` body field.\n\nSome providers use it for KV-cache and scheduling isolation, so one stable value per experiment arm keeps within-arm cache reuse real while keeping arms from sharing cached prefixes. Unset omits the field.",
+          "type": "string"
         },
         "websocket_connect_timeout_ms": {
           "description": "Maximum time (in milliseconds) to wait for a websocket connection attempt before treating it as failed.",

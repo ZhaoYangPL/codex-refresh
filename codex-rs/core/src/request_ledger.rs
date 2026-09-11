@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use codex_config::types::ContextPolicyConfig;
 use codex_config::types::ContextPolicyMode;
+use codex_protocol::ResponseUsageMetadata;
 use codex_protocol::protocol::TokenUsage;
 use serde::Serialize;
 use serde_json::Value;
@@ -309,10 +310,14 @@ impl RawRequestLedger {
         handle: &RawRequestHandle,
         response_id: Option<&str>,
         usage: Option<&TokenUsage>,
+        usage_evidence: Option<&ResponseUsageMetadata>,
         visible_output_tokens: Option<i64>,
         stop_reason: &str,
         identity: Option<&AttemptIdentity>,
     ) -> io::Result<()> {
+        let field_presence = usage.map(|_| {
+            provider_usage_field_presence(usage_evidence.and_then(|m| m.metadata.as_ref()))
+        });
         self.append(
             handle,
             "request_completed",
@@ -321,15 +326,8 @@ impl RawRequestLedger {
                 json!({
                     "response_id": response_id,
                     "provider_usage": usage.map(provider_usage),
-                    "usage_provenance": usage.map(|_| json!({
-                        "input_tokens_total": "provider_reported_via_codex_token_usage",
-                        "cache_read_tokens": "codex_normalized_provider_detail_or_default_zero",
-                        "cache_write_tokens": "codex_normalized_provider_detail_or_default_zero",
-                        "uncached_input_tokens": "host_derived_from_codex_normalized_buckets",
-                        "billed_output_tokens": "provider_reported_via_codex_token_usage",
-                        "reasoning_tokens": "codex_normalized_provider_detail_or_default_zero",
-                        "visible_output_tokens": "host_estimated_model_visible_items_v1",
-                    })),
+                    "provider_usage_field_presence": field_presence.clone(),
+                    "usage_provenance": field_presence.map(usage_provenance),
                     "input_token_semantics": usage.map(|_| "total_includes_cache"),
                     "visible_output_tokens": visible_output_tokens,
                     "provider_reported_cost": null,
@@ -460,11 +458,98 @@ fn provider_usage(usage: &TokenUsage) -> Value {
     })
 }
 
+/// Provider-neutral record of which upstream usage fields the provider's
+/// response actually carried.
+///
+/// Codex normalizes usage into fixed numeric buckets, which loses the
+/// distinction between a provider that explicitly reported `cached_tokens = 0`
+/// and one that simply omitted the field.  Accounting layers must be able to
+/// tell those apart, so the host preserves the field-presence fact and lets the
+/// provider-specific adapter decide what it means.
+///
+/// The host knows no provider's billing semantics and records none here: this
+/// describes only whether an upstream field was present.  Presence is read from
+/// the raw upstream `usage` object that the Responses parser preserved in
+/// [`ResponseUsageMetadata::metadata`]; it is never inferred from `provider_id`,
+/// `model_id`, or a numeric value.
+fn provider_usage_field_presence(raw_usage: Option<&Value>) -> Value {
+    let presence = |path: &[&str]| {
+        let Some(root) = raw_usage else {
+            return "unknown";
+        };
+        match resolve_path(root, path) {
+            None => "provider_field_absent",
+            Some(value) if value.is_null() => "provider_field_null",
+            Some(_) => "provider_reported",
+        }
+    };
+    json!({
+        "source": match raw_usage {
+            Some(_) => "provider_reported_usage_object",
+            None => "provider_usage_object_not_preserved",
+        },
+        "input_tokens": presence(&["input_tokens"]),
+        "input_tokens_details": presence(&["input_tokens_details"]),
+        "input_tokens_details.cached_tokens": presence(&["input_tokens_details", "cached_tokens"]),
+        "input_tokens_details.cache_write_tokens":
+            presence(&["input_tokens_details", "cache_write_tokens"]),
+        "output_tokens": presence(&["output_tokens"]),
+        "output_tokens_details": presence(&["output_tokens_details"]),
+        "output_tokens_details.reasoning_tokens":
+            presence(&["output_tokens_details", "reasoning_tokens"]),
+    })
+}
+
+/// Walk a dotted field path through the raw usage object.
+///
+/// Returns the value found at the end of the path, or `None` when any segment
+/// is missing.  A non-object value part-way along the path cannot carry the
+/// remaining segments, so the rest of the path is absent by definition.
+fn resolve_path<'a>(raw_usage: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = raw_usage;
+    for segment in path {
+        current = current.as_object()?.get(*segment)?;
+    }
+    Some(current)
+}
+
+/// Restate [`provider_usage_field_presence`] in the per-bucket vocabulary the
+/// raw event schema already used.
+///
+/// The labels stay provider-neutral and now follow the preserved evidence
+/// instead of asserting an unconditional default.  Buckets the host derives
+/// rather than receives keep their host-derived label.
+fn usage_provenance(field_presence: Value) -> Value {
+    let label = |bucket: &str| {
+        field_presence
+            .get(bucket)
+            .and_then(Value::as_str)
+            .and_then(|state| match state {
+                "provider_reported" => Some("provider_reported_via_codex_token_usage"),
+                "provider_field_absent" | "provider_field_null" => {
+                    Some("provider_field_absent_normalized_default")
+                }
+                _ => None,
+            })
+            .unwrap_or("provider_usage_object_not_preserved")
+    };
+    json!({
+        "input_tokens_total": label("input_tokens"),
+        "cache_read_tokens": label("input_tokens_details.cached_tokens"),
+        "cache_write_tokens": label("input_tokens_details.cache_write_tokens"),
+        "uncached_input_tokens": "host_derived_from_codex_normalized_buckets",
+        "billed_output_tokens": label("output_tokens"),
+        "reasoning_tokens": label("output_tokens_details.reasoning_tokens"),
+        "visible_output_tokens": "host_estimated_model_visible_items_v1",
+    })
+}
+
 fn arm_name(mode: ContextPolicyMode) -> &'static str {
     match mode {
         ContextPolicyMode::NativeFixed => "native_fixed",
         ContextPolicyMode::ControlledFixed => "controlled_fixed",
         ContextPolicyMode::ExternalStub => "external_stub",
+        ContextPolicyMode::TcpAccumulator => "tcp_accumulator",
         ContextPolicyMode::MpcH1 => "mpc_h1",
         ContextPolicyMode::Mpc => "mpc",
     }
@@ -578,6 +663,13 @@ mod tests {
         }
     }
 
+    fn usage_metadata(raw_usage: Value) -> ResponseUsageMetadata {
+        ResponseUsageMetadata {
+            amount: None,
+            metadata: Some(raw_usage),
+        }
+    }
+
     fn descriptor<'a>() -> RequestDescriptor<'a> {
         RequestDescriptor {
             purpose: RequestPurpose::Serve,
@@ -619,6 +711,13 @@ mod tests {
                     total_tokens: 16,
                     codex_rollout_budget_units: None,
                 }),
+                Some(&usage_metadata(json!({
+                    "input_tokens": 10,
+                    "input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 1},
+                    "output_tokens": 6,
+                    "output_tokens_details": {"reasoning_tokens": 2},
+                    "total_tokens": 16,
+                }))),
                 Some(4),
                 "completed",
                 None,
@@ -639,6 +738,284 @@ mod tests {
         assert_eq!(rows[2]["provider_usage"]["billed_output_tokens"], 6);
         assert_eq!(rows[2]["provider_usage"]["reasoning_tokens"], 2);
         assert_eq!(rows[2]["visible_output_tokens"], 4);
+        assert_eq!(
+            rows[2]["provider_usage_field_presence"]["source"],
+            "provider_reported_usage_object"
+        );
+        assert_eq!(
+            rows[2]["provider_usage_field_presence"]["input_tokens_details.cached_tokens"],
+            "provider_reported"
+        );
+        assert_eq!(
+            rows[2]["usage_provenance"]["cache_read_tokens"],
+            "provider_reported_via_codex_token_usage"
+        );
+    }
+
+    /// The whole point of the evidence field: a provider that explicitly
+    /// reports zero and one that omits the field both normalize to the same
+    /// numeric bucket, and only the presence record can tell them apart.
+    #[test]
+    fn presence_separates_a_reported_zero_from_an_omitted_field() {
+        let reported_zero = provider_usage_field_presence(Some(&json!({
+            "input_tokens": 10,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 6,
+        })));
+        let omitted = provider_usage_field_presence(Some(&json!({
+            "input_tokens": 10,
+            "output_tokens": 6,
+        })));
+
+        assert_eq!(
+            reported_zero["input_tokens_details.cached_tokens"],
+            "provider_reported"
+        );
+        assert_eq!(
+            omitted["input_tokens_details.cached_tokens"],
+            "provider_field_absent"
+        );
+        assert_eq!(reported_zero["input_tokens_details"], "provider_reported");
+        assert_eq!(omitted["input_tokens_details"], "provider_field_absent");
+    }
+
+    #[test]
+    fn presence_tracks_each_field_path_independently() {
+        let non_zero = provider_usage_field_presence(Some(&json!({
+            "input_tokens": 10,
+            "input_tokens_details": {"cached_tokens": 7},
+            "output_tokens": 6,
+            "output_tokens_details": {"reasoning_tokens": 4},
+        })));
+        assert_eq!(
+            non_zero["input_tokens_details.cached_tokens"],
+            "provider_reported"
+        );
+        assert_eq!(
+            non_zero["input_tokens_details.cache_write_tokens"],
+            "provider_field_absent"
+        );
+        assert_eq!(
+            non_zero["output_tokens_details.reasoning_tokens"],
+            "provider_reported"
+        );
+
+        // A details object that exists but omits the leaf reports the leaf as
+        // absent; the container itself is still reported.
+        let partial = provider_usage_field_presence(Some(&json!({
+            "input_tokens": 10,
+            "input_tokens_details": {},
+            "output_tokens": 6,
+        })));
+        assert_eq!(partial["input_tokens_details"], "provider_reported");
+        assert_eq!(
+            partial["input_tokens_details.cached_tokens"],
+            "provider_field_absent"
+        );
+    }
+
+    #[test]
+    fn presence_treats_an_explicit_null_details_object_as_unreported() {
+        let nulled = provider_usage_field_presence(Some(&json!({
+            "input_tokens": 10,
+            "input_tokens_details": Value::Null,
+            "output_tokens": 6,
+        })));
+        assert_eq!(nulled["input_tokens_details"], "provider_field_null");
+        assert_eq!(
+            nulled["input_tokens_details.cached_tokens"],
+            "provider_field_absent"
+        );
+    }
+
+    #[test]
+    fn presence_stays_unknown_when_no_usage_object_was_preserved() {
+        let unknown = provider_usage_field_presence(None);
+        assert_eq!(unknown["source"], "provider_usage_object_not_preserved");
+        assert_eq!(unknown["input_tokens"], "unknown");
+        assert_eq!(unknown["input_tokens_details.cached_tokens"], "unknown");
+
+        // An empty metadata object is not evidence either: absent fields must
+        // not be asserted as absent when nothing was preserved.
+        let empty = provider_usage_field_presence(Some(&json!({})));
+        assert_eq!(empty["source"], "provider_reported_usage_object");
+        assert_eq!(empty["input_tokens"], "provider_field_absent");
+    }
+
+    #[test]
+    fn provenance_labels_follow_the_evidence_rather_than_a_fixed_default() {
+        let reported = usage_provenance(provider_usage_field_presence(Some(&json!({
+            "input_tokens": 10,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 6,
+        }))));
+        assert_eq!(
+            reported["cache_read_tokens"],
+            "provider_reported_via_codex_token_usage"
+        );
+        assert_eq!(
+            reported["input_tokens_total"],
+            "provider_reported_via_codex_token_usage"
+        );
+        assert_eq!(
+            reported["reasoning_tokens"],
+            "provider_field_absent_normalized_default"
+        );
+        // The host still derives this bucket itself, so its label is unchanged.
+        assert_eq!(
+            reported["uncached_input_tokens"],
+            "host_derived_from_codex_normalized_buckets"
+        );
+
+        let unpreserved = usage_provenance(provider_usage_field_presence(None));
+        assert_eq!(
+            unpreserved["cache_read_tokens"],
+            "provider_usage_object_not_preserved"
+        );
+    }
+
+    /// Presence is a fact about the upstream object's keys. It must never be
+    /// derived from the provider identity, the model identity, or a numeric
+    /// value's being zero -- all three of which are deliberately varied here
+    /// while the presence answer stays the same.
+    #[tokio::test]
+    async fn presence_is_not_inferred_from_identity_or_numeric_value() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("requests.raw.jsonl");
+        let ledger = RawRequestLedger::from_config(&config(&path))
+            .expect("ledger")
+            .expect("enabled");
+
+        for (index, raw_usage) in [
+            json!({
+                "input_tokens": 10,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 6,
+            }),
+            json!({
+                "input_tokens": 10,
+                "input_tokens_details": {"cached_tokens": 5},
+                "output_tokens": 6,
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = ledger.begin_request(descriptor()).await.expect("start");
+            ledger
+                .completed(
+                    &request,
+                    Some("response"),
+                    Some(&TokenUsage {
+                        input_tokens: 10,
+                        cached_input_tokens: 0,
+                        cache_write_input_tokens: 0,
+                        output_tokens: 6,
+                        reasoning_output_tokens: 0,
+                        total_tokens: 16,
+                        codex_rollout_budget_units: None,
+                    }),
+                    Some(&usage_metadata(raw_usage)),
+                    None,
+                    "completed",
+                    None,
+                )
+                .await
+                .unwrap_or_else(|err| panic!("complete {index}: {err}"));
+        }
+
+        let rows = std::fs::read_to_string(&path)
+            .expect("read")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("json"))
+            .filter(|row| row["event"] == "request_completed")
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        // The normalized bucket is identical in both rows, so a value-based
+        // rule could not have told them apart; the evidence still does.
+        assert!(
+            rows.iter()
+                .all(|row| row["provider_usage"]["cache_read_tokens"] == 0)
+        );
+        assert!(rows.iter().all(
+            |row| row["provider_usage_field_presence"]["input_tokens_details.cached_tokens"]
+                == "provider_reported"
+        ));
+        assert_eq!(rows[0]["provider_id"], "fixture-provider");
+        assert_eq!(rows[1]["model_id"], "fixture-model");
+    }
+
+    #[tokio::test]
+    async fn a_completion_without_a_preserved_usage_object_records_unknown_presence() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("requests.raw.jsonl");
+        let ledger = RawRequestLedger::from_config(&config(&path))
+            .expect("ledger")
+            .expect("enabled");
+        let request = ledger.begin_request(descriptor()).await.expect("start");
+        ledger
+            .completed(
+                &request,
+                Some("response"),
+                Some(&TokenUsage {
+                    input_tokens: 10,
+                    cached_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 6,
+                    reasoning_output_tokens: 0,
+                    total_tokens: 16,
+                    codex_rollout_budget_units: None,
+                }),
+                None,
+                None,
+                "completed",
+                None,
+            )
+            .await
+            .expect("complete");
+
+        let row = std::fs::read_to_string(&path)
+            .expect("read")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("json"))
+            .find(|row| row["event"] == "request_completed")
+            .expect("terminal row");
+        assert_eq!(
+            row["provider_usage_field_presence"]["source"],
+            "provider_usage_object_not_preserved"
+        );
+        assert_eq!(
+            row["provider_usage_field_presence"]["input_tokens_details.cached_tokens"],
+            "unknown"
+        );
+        assert_eq!(
+            row["usage_provenance"]["cache_read_tokens"],
+            "provider_usage_object_not_preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_records_no_presence_at_all() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("requests.raw.jsonl");
+        let ledger = RawRequestLedger::from_config(&config(&path))
+            .expect("ledger")
+            .expect("enabled");
+        let request = ledger.begin_request(descriptor()).await.expect("start");
+        ledger
+            .failed(&request, "provider", "unavailable", None)
+            .await
+            .expect("terminal");
+
+        let row = std::fs::read_to_string(&path)
+            .expect("read")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("json"))
+            .find(|row| row["event"] == "request_failed")
+            .expect("terminal row");
+        assert!(row["provider_usage"].is_null());
+        assert!(row.get("provider_usage_field_presence").is_none());
+        assert!(row.get("usage_provenance").is_none());
     }
 
     #[tokio::test]
@@ -725,6 +1102,7 @@ mod tests {
                 &request,
                 Some("response"),
                 None,
+                None,
                 Some(1),
                 "completed",
                 Some(&fallback),
@@ -801,6 +1179,7 @@ mod tests {
         ledger
             .completed(
                 &request,
+                None,
                 None,
                 None,
                 Some(1),
@@ -955,6 +1334,31 @@ mod tests {
             .expect("resume")
             .expect("enabled");
         drop(resumed);
+    }
+
+    #[test]
+    fn every_policy_mode_maps_to_its_own_frozen_ledger_arm() {
+        // The arm is part of the frozen run identity, so each formal V1 rollout
+        // arm must be distinguishable inside one ledger stream.
+        assert_eq!(
+            [
+                ContextPolicyMode::NativeFixed,
+                ContextPolicyMode::ControlledFixed,
+                ContextPolicyMode::ExternalStub,
+                ContextPolicyMode::TcpAccumulator,
+                ContextPolicyMode::MpcH1,
+                ContextPolicyMode::Mpc,
+            ]
+            .map(arm_name),
+            [
+                "native_fixed",
+                "controlled_fixed",
+                "external_stub",
+                "tcp_accumulator",
+                "mpc_h1",
+                "mpc"
+            ]
+        );
     }
 
     #[test]

@@ -86,6 +86,7 @@ use codex_file_system::find_nearest_ancestor_with_markers;
 use codex_login::CodexAuth;
 use codex_model_provider::RemoteCompactionSupport;
 use codex_protocol::ResponseItemId;
+use codex_protocol::ResponseUsageMetadata;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ServiceTier;
@@ -1704,6 +1705,7 @@ async fn run_sampling_request(
                             request,
                             output.response_id.as_deref(),
                             output.token_usage.as_ref(),
+                            output.usage_metadata.as_ref(),
                             output.visible_output_tokens,
                             output.stop_reason,
                             None,
@@ -2026,6 +2028,10 @@ struct SamplingRequestResult {
     last_agent_message: Option<String>,
     response_id: Option<String>,
     token_usage: Option<TokenUsage>,
+    /// Raw upstream usage object, preserved so the request ledger can record
+    /// which fields the provider actually reported rather than only the
+    /// normalized buckets.
+    usage_metadata: Option<ResponseUsageMetadata>,
     visible_output_tokens: Option<i64>,
     stop_reason: &'static str,
 }
@@ -2886,6 +2892,7 @@ async fn try_run_sampling_request(
                         last_agent_message,
                         response_id: None,
                         token_usage: None,
+                        usage_metadata: None,
                         visible_output_tokens: Some(visible_output_tokens),
                         stop_reason: "host_preempted_for_mailbox",
                     });
@@ -3070,6 +3077,7 @@ async fn try_run_sampling_request(
                     last_agent_message,
                     response_id: Some(response_id),
                     token_usage,
+                    usage_metadata,
                     visible_output_tokens: Some(visible_output_tokens),
                     stop_reason: "completed",
                 });

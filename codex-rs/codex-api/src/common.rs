@@ -61,6 +61,11 @@ pub struct CompactionInput<'a> {
     pub prompt_cache_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextControls>,
+    /// End-user identifier some providers use for KV-cache and scheduling
+    /// isolation. Omitted entirely when unset so providers that do not accept it
+    /// see exactly the body they saw before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access_programs: Option<AccessPrograms>,
 }
@@ -300,6 +305,11 @@ pub struct ResponsesApiRequest {
     pub prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextControls>,
+    /// End-user identifier some providers use for KV-cache and scheduling
+    /// isolation. Omitted entirely when unset so providers that do not accept it
+    /// see exactly the body they saw before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_metadata: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -324,6 +334,7 @@ impl<'a> From<&'a ResponsesApiRequest> for ResponseCreateWsRequest<'a> {
             service_tier: request.service_tier.as_deref(),
             prompt_cache_key: request.prompt_cache_key.as_deref(),
             text: request.text.as_ref(),
+            user: request.user.as_deref(),
             generate: None,
             client_metadata: request.client_metadata.clone(),
             access_programs: request.access_programs,
@@ -355,6 +366,9 @@ pub struct ResponseCreateWsRequest<'a> {
     pub prompt_cache_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<&'a TextControls>,
+    /// Mirrors [`ResponsesApiRequest::user`] for the WebSocket transport.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generate: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

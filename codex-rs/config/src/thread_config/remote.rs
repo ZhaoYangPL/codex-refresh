@@ -183,6 +183,7 @@ fn model_provider_from_proto(
         aws: None,
         wire_api,
         query_params: provider.query_params.map(redacted_string_map),
+        user_id: None,
         http_headers: provider.http_headers.map(redacted_string_map),
         env_http_headers: provider.env_http_headers.map(|map| map.values),
         request_max_retries: provider.request_max_retries,
@@ -211,6 +212,9 @@ fn model_provider_to_proto(
         aws: _,
         wire_api,
         query_params,
+        // The app-server provider protocol carries no cache-isolation identity,
+        // so it is dropped rather than invented on the way to the proto.
+        user_id: _,
         http_headers,
         env_http_headers,
         request_max_retries,
@@ -539,6 +543,7 @@ mod tests {
 
     fn expected_provider() -> ModelProviderInfo {
         ModelProviderInfo {
+            user_id: None,
             name: "Local".to_string(),
             base_url: Some("http://127.0.0.1:8061/api/codex".to_string()),
             env_key: None,

@@ -46,6 +46,7 @@ use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::mount_models_once;
 use core_test_support::responses::strip_response_item_ids_from_json;
 use core_test_support::skip_if_no_network;
+use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
@@ -60,6 +61,7 @@ use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::mount_compact_json_once;
 use core_test_support::responses::mount_compact_response_sequence;
+use core_test_support::responses::mount_response_once;
 use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
@@ -298,6 +300,139 @@ for line in sys.stdin:
         ..Default::default()
     };
     (config, protocol_log)
+}
+
+/// A Phase 8B persistent bridge stub that speaks the TCP arm's responses.
+///
+/// It deliberately returns no `q_keep`/`q_compact`/`planner` fields: the TCP arm
+/// has no horizon, no scenarios, and no recovery model, and the host must not
+/// require them.
+fn tcp_bridge_fixture(
+    directory: &TempDir,
+    raw_log_path: AbsolutePathBuf,
+    behavior: &str,
+) -> (ContextPolicyConfig, PathBuf) {
+    let script_path = directory.path().join("persistent_tcp_bridge.py");
+    let protocol_log = directory.path().join("bridge-protocol.jsonl");
+    fs::write(
+        &script_path,
+        r#"import json
+import sys
+
+log_path = sys.argv[1]
+behavior = sys.argv[2]
+for line in sys.stdin:
+    request = json.loads(line)
+    body = {"type": request["type"], "epoch": request["epoch"]}
+    for key in ("controller_mode", "seed", "recovery_artifact_id", "z_schema_version"):
+        body[key] = request.get(key)
+    if request["type"] == "observe_transition":
+        body["previous_action"] = request["transition"]["previous_action"]
+    if request["type"] == "compact_feedback":
+        body["feedback"] = request["feedback"]
+    if request["type"] == "terminal":
+        body["reason"] = request.get("reason")
+    with open(log_path, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(body) + "\n")
+    response = {key: request[key] for key in (
+        "protocol_version", "request_id", "run_id", "task_id",
+        "replicate_id", "thread_id", "epoch")}
+    kind = request["type"]
+    if kind == "initialize":
+        response.update(type="initialized", controller_mode=request["controller_mode"])
+    elif kind == "decide":
+        compact = (behavior in ("compact_at_epoch_zero", "feedback_failure")
+                   and request["epoch"] == 0)
+        if behavior == "malformed_decide":
+            response.update(type="decision")
+        elif behavior == "planner_emergency":
+            response.update(type="decision", action=None, decision_mode="emergency",
+                            predicted_post_compact_L=None,
+                            diagnostics={"controller_mode": "tcp_accumulator",
+                                         "rent_increment": None,
+                                         "keep_feasible": False,
+                                         "compact_feasible": False})
+        elif compact:
+            response.update(type="decision", action="COMPACT",
+                            decision_mode="tcp_accumulator",
+                            predicted_post_compact_L=5,
+                            diagnostics={"controller_mode": "tcp_accumulator",
+                                         "rent_increment": 1.0,
+                                         "accumulator_before_increment": 0.0,
+                                         "accumulator_after_increment": 1.0,
+                                         "buy_price": 0.5,
+                                         "keep_feasible": True,
+                                         "compact_feasible": True})
+        else:
+            response.update(type="decision", action="KEEP",
+                            decision_mode="tcp_accumulator",
+                            predicted_post_compact_L=None,
+                            diagnostics={"controller_mode": "tcp_accumulator",
+                                         "rent_increment": 1.0,
+                                         "accumulator_before_increment": 0.0,
+                                         "accumulator_after_increment": 1.0,
+                                         "buy_price": 0.5,
+                                         "keep_feasible": True,
+                                         "compact_feasible": True})
+    elif kind == "observe_transition":
+        response.update(type="transition_observed")
+    elif kind == "compact_feedback":
+        if behavior == "feedback_failure":
+            response.update(type="infrastructure_error", error_code="fixture")
+        else:
+            response.update(type="compact_feedback_accepted",
+                            reset_estimator_version=1, accumulator=0.0)
+    elif kind == "terminal":
+        response.update(type="unexpected" if behavior == "terminal_failure" else "terminated")
+    elif kind == "shutdown":
+        response.update(type="shutdown_complete")
+    print(json.dumps(response, separators=(",", ":")), flush=True)
+    if kind == "shutdown":
+        break
+"#,
+    )
+    .expect("write persistent TCP bridge fixture");
+    let candidates = if cfg!(windows) {
+        ["python", "python3"]
+    } else {
+        ["python3", "python"]
+    };
+    let python = candidates
+        .into_iter()
+        .find_map(|candidate| which::which(candidate).ok())
+        .expect("Phase 8B host bridge test requires Python");
+    let config = ContextPolicyConfig {
+        mode: ContextPolicyMode::TcpAccumulator,
+        run_id: Some("phase8t-tcp-run".to_string()),
+        task_id: Some("phase8t-tcp-task".to_string()),
+        replicate_id: Some(0),
+        raw_log_path: Some(raw_log_path),
+        bridge_command: Some(
+            AbsolutePathBuf::from_absolute_path(&python).expect("Python path is absolute"),
+        ),
+        bridge_args: vec![
+            script_path.to_string_lossy().into_owned(),
+            protocol_log.to_string_lossy().into_owned(),
+            behavior.to_string(),
+        ],
+        bridge_timeout_ms: Some(2_000),
+        controller_config_id: Some("fixture-controller-v1".to_string()),
+        z_schema_version: Some("phase4-observable-v1".to_string()),
+        // TCP needs no scenario seed and no recovery model.  The shared run
+        // manifest may still carry them; here `recovery_artifact_id` is set on
+        // purpose so the test can prove it is never forwarded.
+        recovery_artifact_id: Some("fixture-recovery-v1".to_string()),
+        ..Default::default()
+    };
+    (config, protocol_log)
+}
+
+fn read_bridge_protocol(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .expect("read bridge protocol log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse bridge protocol JSONL"))
+        .collect()
 }
 
 fn read_policy_records(path: &Path) -> Vec<Value> {
@@ -2517,6 +2652,732 @@ async fn planner_emergency_after_a_real_interval_is_a_distinct_censored_terminal
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_accumulator_keep_serves_once_without_compacting() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let request_log = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("m-tcp-keep", FINAL_REPLY),
+            ev_completed_with_tokens("r-tcp-keep", /*total_tokens*/ 10),
+        ]),
+    )
+    .await;
+    let policy_dir = TempDir::new().expect("create policy fixture directory");
+    let policy_path = policy_dir.path().join("tcp-keep-policy.jsonl");
+    let raw_log_path =
+        AbsolutePathBuf::from_absolute_path(&policy_path).expect("policy log path is absolute");
+    let (mut policy, protocol_log) = tcp_bridge_fixture(&policy_dir, raw_log_path, "always_keep");
+    let request_path = policy_dir.path().join("tcp-keep-requests.jsonl");
+    policy.request_raw_log_path = Some(
+        AbsolutePathBuf::from_absolute_path(&request_path).expect("request log path is absolute"),
+    );
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        config.experimental_context_policy = policy;
+    });
+    let test = builder.build(&server).await.expect("build test codex");
+
+    test.submit_text_turn("tcp keep epoch")
+        .await
+        .expect("submit turn");
+    test.codex
+        .submit(Op::Shutdown)
+        .await
+        .expect("shutdown session");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "KEEP must issue exactly one normal serve"
+    );
+    assert!(
+        !body_contains_text(&requests[0].body_json().to_string(), SUMMARIZATION_PROMPT),
+        "KEEP must not invoke the summary compactor"
+    );
+
+    let records = read_policy_records(&policy_path);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["event"], "decision");
+    assert_eq!(records[0]["action"], "KEEP");
+    assert_eq!(records[0]["policy_mode"], "tcp_accumulator");
+    assert_eq!(records[0]["decision_mode"], "tcp_accumulator");
+    // The TCP arm speaks the same bridge protocol as the MPC arms and observes
+    // the same formal reusable prefix K_t.
+    assert_eq!(records[0]["protocol_version"], "phase8b-v1");
+    assert_eq!(records[0]["reusable_prefix_tokens"], 0);
+    assert_eq!(
+        records[0]["K_measurement_kind"],
+        "codex_pre_request_no_prior_v1"
+    );
+    assert_eq!(records[1]["event"], "ready_to_invoke");
+    assert_eq!(records[1]["action"], "KEEP");
+
+    let protocol = read_bridge_protocol(&protocol_log);
+    let kinds = protocol
+        .iter()
+        .map(|event| event["type"].as_str().expect("event type"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec!["initialize", "decide", "terminal", "shutdown"],
+        "a KEEP epoch must never send compact feedback"
+    );
+    assert_eq!(protocol[0]["controller_mode"], "tcp_accumulator");
+    assert_eq!(protocol[0]["z_schema_version"], "phase4-observable-v1");
+
+    let starts = read_request_records(&request_path)
+        .into_iter()
+        .filter(|record| record["event"] == "request_started")
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0]["request_purpose"], "serve");
+    assert_eq!(starts[0]["arm"], "tcp_accumulator");
+    assert_eq!(starts[0]["decision_epoch"], 0);
+    assert_eq!(starts[0]["decision_action"], "KEEP");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_accumulator_keeps_one_persistent_bridge_across_epochs() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let first_turn = sse(vec![
+        ev_assistant_message("m-tcp-epoch-0", FIRST_REPLY),
+        ev_completed_with_tokens("r-tcp-epoch-0", /*total_tokens*/ 10),
+    ]);
+    let second_turn = sse(vec![
+        ev_assistant_message("m-tcp-epoch-1", FINAL_REPLY),
+        ev_completed_with_tokens("r-tcp-epoch-1", /*total_tokens*/ 10),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![first_turn, second_turn]).await;
+
+    let policy_dir = TempDir::new().expect("create policy fixture directory");
+    let policy_path = policy_dir.path().join("tcp-epochs-policy.jsonl");
+    let raw_log_path =
+        AbsolutePathBuf::from_absolute_path(&policy_path).expect("policy log is absolute");
+    let (policy, protocol_log) = tcp_bridge_fixture(&policy_dir, raw_log_path, "always_keep");
+    let test = tcp_policy_codex(&server, policy).await;
+
+    test.submit_text_turn("tcp epoch zero")
+        .await
+        .expect("epoch 0");
+    test.submit_text_turn("tcp epoch one")
+        .await
+        .expect("epoch 1");
+    let _ = test.codex.submit(Op::Shutdown).await;
+
+    assert_eq!(
+        request_log.requests().len(),
+        2,
+        "two KEEP epochs must serve exactly twice"
+    );
+
+    let records = read_policy_records(&policy_path);
+    assert_eq!(records.len(), 4, "one decision and one ready per epoch");
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (
+                record["event"].as_str().expect("event"),
+                record["epoch"].as_u64()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("decision", Some(0)),
+            ("ready_to_invoke", Some(0)),
+            ("decision", Some(1)),
+            ("ready_to_invoke", Some(1)),
+        ]
+    );
+    assert_eq!(
+        records[0]["K_measurement_kind"],
+        "codex_pre_request_no_prior_v1"
+    );
+    // The formal reusable prefix is observed from the second epoch on.
+    assert_eq!(
+        records[2]["K_measurement_kind"],
+        "codex_pre_request_common_prefix_v1"
+    );
+    assert!(records[2]["reusable_prefix_tokens"].is_u64());
+
+    // One handshake for two epochs: the bridge process persists and is never
+    // respawned between decisions.
+    let protocol = read_bridge_protocol(&protocol_log);
+    let kinds = protocol
+        .iter()
+        .map(|event| event["type"].as_str().expect("event type"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            "initialize",
+            "decide",
+            "observe_transition",
+            "decide",
+            "terminal",
+            "shutdown"
+        ]
+    );
+    assert_eq!(protocol[2]["previous_action"], "KEEP");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_accumulator_planner_emergency_issues_no_provider_request() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let policy_dir = TempDir::new().expect("create policy fixture directory");
+    let policy_path = policy_dir.path().join("tcp-emergency-policy.jsonl");
+    let raw_log_path =
+        AbsolutePathBuf::from_absolute_path(&policy_path).expect("policy log is absolute");
+    let (policy, protocol_log) = tcp_bridge_fixture(&policy_dir, raw_log_path, "planner_emergency");
+    let test = tcp_policy_codex(&server, policy).await;
+
+    // Both KEEP and the predicted COMPACT are infeasible: this is a valid
+    // planner outcome, not an infrastructure failure.  The host must terminate
+    // the trajectory as censored and issue no provider request at all.
+    submit_tcp_turn(&test.codex, "tcp planner emergency").await;
+    let event = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::Error(_) | EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert!(
+        matches!(event, EventMsg::Error(_)),
+        "an actionless emergency must surface an error, not complete normally"
+    );
+    let _ = test.codex.submit(Op::Shutdown).await;
+
+    let served = server
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .into_iter()
+        .filter(|request| request.url.path() == "/v1/responses")
+        .count();
+    assert_eq!(served, 0, "an emergency must not invoke the provider");
+
+    let protocol = read_bridge_protocol(&protocol_log);
+    let kinds = protocol
+        .iter()
+        .map(|event| event["type"].as_str().expect("event type"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec!["initialize", "decide", "terminal", "shutdown"],
+        "an emergency must close the bridge without a compact feedback"
+    );
+    assert_eq!(protocol[2]["reason"], "planner_emergency_censored");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_accumulator_compacts_through_the_native_compactor_then_serves_once() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let summary = format!("{SUMMARY_TEXT}-tcp");
+    let compact_turn = sse(vec![
+        ev_assistant_message("m-tcp-summary", &summary),
+        ev_completed_with_tokens("r-tcp-summary", /*total_tokens*/ 10),
+    ]);
+    let serve_turn = sse(vec![
+        ev_assistant_message("m-tcp-serve", FINAL_REPLY),
+        ev_completed_with_tokens("r-tcp-serve", /*total_tokens*/ 10),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![compact_turn, serve_turn]).await;
+
+    let policy_dir = TempDir::new().expect("create policy fixture directory");
+    let policy_path = policy_dir.path().join("tcp-compact-policy.jsonl");
+    let raw_log_path =
+        AbsolutePathBuf::from_absolute_path(&policy_path).expect("policy log path is absolute");
+    let (mut policy, protocol_log) =
+        tcp_bridge_fixture(&policy_dir, raw_log_path, "compact_at_epoch_zero");
+    let request_path = policy_dir.path().join("tcp-compact-requests.jsonl");
+    policy.request_raw_log_path = Some(
+        AbsolutePathBuf::from_absolute_path(&request_path).expect("request log path is absolute"),
+    );
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        config.experimental_context_policy = policy;
+    });
+    let test = builder.build(&server).await.expect("build test codex");
+
+    test.submit_text_turn("tcp compact epoch")
+        .await
+        .expect("submit turn");
+    test.codex
+        .submit(Op::Shutdown)
+        .await
+        .expect("shutdown session");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "TCP COMPACT must compact then serve once"
+    );
+    assert!(
+        body_contains_text(&requests[0].body_json().to_string(), SUMMARIZATION_PROMPT),
+        "the TCP arm must reuse the existing traditional summary request"
+    );
+    assert!(
+        requests[1].body_json().to_string().contains(&summary),
+        "the follow-up serve must be rebuilt from the native compactor output"
+    );
+    assert!(
+        !body_contains_text(&requests[1].body_json().to_string(), SUMMARIZATION_PROMPT),
+        "the normal serve must not retain the compaction trigger"
+    );
+
+    let protocol = read_bridge_protocol(&protocol_log);
+    let kinds = protocol
+        .iter()
+        .map(|event| event["type"].as_str().expect("event type"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            "initialize",
+            "decide",
+            "compact_feedback",
+            "terminal",
+            "shutdown"
+        ],
+        "a successful policy COMPACT must report its realized length back once"
+    );
+    // Only workload-prediction modes declare a recovery artifact; the TCP arm
+    // must not forward the one carried by the shared run manifest.
+    assert_eq!(protocol[0]["controller_mode"], "tcp_accumulator");
+    assert_eq!(protocol[0]["recovery_artifact_id"], Value::Null);
+    let feedback = &protocol[2]["feedback"];
+    assert_eq!(feedback["predicted_post_compact_L"], 5);
+    assert!(
+        feedback["observed_post_compact_L"].is_i64(),
+        "the realized post-compact length must be reported: {feedback}"
+    );
+
+    let records = read_policy_records(&policy_path);
+    assert_eq!(records[0]["event"], "decision");
+    assert_eq!(records[0]["action"], "COMPACT");
+    assert_eq!(records[0]["compaction_reason"], "context_limit");
+    assert_eq!(records[0]["protocol_version"], "phase8b-v1");
+    assert_eq!(records[1]["event"], "ready_to_invoke");
+    assert_eq!(records[1]["action"], "COMPACT");
+    assert_eq!(
+        records[1]["model_visible_request"]["input"],
+        requests[1].body_json()["input"],
+        "ready evidence must match the rebuilt request that was served"
+    );
+
+    let starts = read_request_records(&request_path)
+        .into_iter()
+        .filter(|record| record["event"] == "request_started")
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 2);
+    assert_eq!(
+        starts
+            .iter()
+            .map(|record| record["request_purpose"].as_str().expect("purpose"))
+            .collect::<Vec<_>>(),
+        vec!["compact_summary", "serve"]
+    );
+    assert_eq!(
+        starts
+            .iter()
+            .map(|record| record["arm"].as_str().expect("arm"))
+            .collect::<Vec<_>>(),
+        vec!["tcp_accumulator", "tcp_accumulator"]
+    );
+    assert_eq!(starts[0]["decision_epoch"], 0);
+    assert_eq!(starts[0]["decision_action"], "COMPACT");
+    assert_eq!(starts[0]["compaction_kind"], "policy");
+    assert_eq!(starts[0]["compaction_id"], "phase8t-tcp-run:compact:0");
+    assert_eq!(starts[0]["reset_id"], "phase8t-tcp-run:reset:0");
+}
+
+/// HARD GATE 0: when the TCP arm selects COMPACT and the real traditional
+/// compact-summary invocation fails, the run must fail closed.  No rebuilt
+/// post-COMPACT request, no `compact_feedback`, no reset-estimator update, no
+/// TCP accumulator reset, and no follow-up normal serve may be produced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_accumulator_failed_compact_summary_is_fail_closed() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    // The compact summary is the only provider request this trajectory may
+    // issue, so exactly one failing response is mounted and no follow-up is
+    // queued: a second request would be unmatched, and the request-count and
+    // ledger assertions below pin that down independently.
+    let summary_log = mount_response_once(
+        &server,
+        sse_response(sse_failed(
+            "resp-tcp-summary-fail",
+            "server_error",
+            "tcp compact summary failed",
+        )),
+    )
+    .await;
+
+    let policy_dir = TempDir::new().expect("create policy fixture directory");
+    let policy_path = policy_dir.path().join("tcp-failed-summary-policy.jsonl");
+    let raw_log_path =
+        AbsolutePathBuf::from_absolute_path(&policy_path).expect("policy log is absolute");
+    let (mut policy, protocol_log) =
+        tcp_bridge_fixture(&policy_dir, raw_log_path, "compact_at_epoch_zero");
+    let request_path = policy_dir.path().join("tcp-failed-summary-requests.jsonl");
+    policy.request_raw_log_path =
+        Some(AbsolutePathBuf::from_absolute_path(&request_path).expect("request log is absolute"));
+
+    let mut model_provider = non_openai_model_provider(&server);
+    // Fail fast: the accepted retry lifecycle must not mask the primary
+    // failure, and this trajectory should observe exactly one attempt.
+    model_provider.stream_max_retries = Some(0);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        config.experimental_context_policy = policy;
+    });
+    let test = builder.build(&server).await.expect("build test codex");
+
+    submit_tcp_turn(&test.codex, "tcp failed compact summary").await;
+    let event = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::Error(_) | EventMsg::TurnComplete(_))
+    })
+    .await;
+    let EventMsg::Error(error) = &event else {
+        panic!(
+            "a failed compact summary must fail the run closed instead of completing: {event:?}"
+        );
+    };
+    // (3) the failure surfaces through the accepted typed provider semantics
+    // and carries the real summary failure, not a bridge or unrelated error.
+    assert!(
+        error.message.contains("tcp compact summary failed"),
+        "the run must fail with the real compact-summary provider failure, got: {}",
+        error.message
+    );
+    assert!(
+        error
+            .message
+            .contains("stream disconnected before completion"),
+        "the summary failure must keep its typed provider-stream semantics, got: {}",
+        error.message
+    );
+    let _ = test.codex.submit(Op::Shutdown).await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    // (1) the TCP decision really was COMPACT, and it was taken at the
+    // canonical pre-invocation seam through the phase8b bridge.
+    let records = read_policy_records(&policy_path);
+    assert_eq!(records[0]["event"], "decision");
+    assert_eq!(records[0]["action"], "COMPACT");
+    assert_eq!(records[0]["compaction_reason"], "context_limit");
+    assert_eq!(records[0]["protocol_version"], "phase8b-v1");
+
+    // (2) the traditional native compactor is the path that was attempted.
+    let requests = summary_log.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "a failed summary must not be followed by another provider request"
+    );
+    assert!(
+        body_contains_text(&requests[0].body_json().to_string(), SUMMARIZATION_PROMPT),
+        "the single failed request must be the traditional compact summary"
+    );
+
+    // (4) no rebuilt post-COMPACT state was ever produced.
+    assert!(
+        !records
+            .iter()
+            .any(|record| record["event"] == "ready_to_invoke"),
+        "a failed summary must not produce rebuilt-context ready evidence: {records:?}"
+    );
+
+    // (5)(7)(8)(9) no compact_feedback means neither the TCP accumulator nor
+    // the reset estimator can have been advanced by this failed COMPACT.
+    let protocol = read_bridge_protocol(&protocol_log);
+    let kinds = protocol
+        .iter()
+        .map(|event| event["type"].as_str().expect("event type"))
+        .collect::<Vec<_>>();
+    assert!(
+        !kinds.contains(&"compact_feedback"),
+        "a failed summary must never be reported back as a successful COMPACT: {kinds:?}"
+    );
+    assert!(
+        protocol.iter().all(|event| event["feedback"].is_null()),
+        "no compact-feedback payload may be fabricated"
+    );
+    assert_eq!(protocol[0]["controller_mode"], "tcp_accumulator");
+
+    // (3)(6)(10) the ledger keeps the failed attempt typed, records no serve,
+    // and never claims a successful compaction/reset linkage.
+    let request_records = read_request_records(&request_path);
+    let starts = request_records
+        .iter()
+        .filter(|record| record["event"] == "request_started")
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 1, "exactly one logical summary request");
+    assert_eq!(starts[0]["request_purpose"], "compact_summary");
+    assert_eq!(starts[0]["arm"], "tcp_accumulator");
+    assert_eq!(starts[0]["decision_epoch"], 0);
+    assert_eq!(starts[0]["decision_action"], "COMPACT");
+    assert_eq!(starts[0]["compaction_kind"], "policy");
+    assert!(
+        !request_records
+            .iter()
+            .any(|record| record["request_purpose"] == "serve"),
+        "no normal serve may be logged after a failed summary: {request_records:?}"
+    );
+
+    // The whole ledger lifecycle of the failed summary, in order. `stream_max_retries
+    // = 0` makes the very first failure terminal, so the run must record the start,
+    // the attempt, the attempt failure, and the request-level failure — and then
+    // stop. `retry_scheduled` would mean a second attempt was queued, which would
+    // also violate the single-provider-request assertion above.
+    let events = request_records
+        .iter()
+        .map(|record| record["event"].as_str().expect("ledger event name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events,
+        vec![
+            "request_started",
+            "attempt_started",
+            "attempt_failed",
+            "request_failed",
+        ],
+        "a failed summary must terminate its ledger lifecycle without completing: {request_records:?}"
+    );
+    assert!(
+        !events.contains(&"request_completed"),
+        "no request_completed may exist for a failed summary: {events:?}"
+    );
+
+    // The terminal records keep the accepted typed failure semantics rather than
+    // degrading to an untyped or optimistic outcome.
+    let attempt_failed = &request_records[2];
+    let request_failed = &request_records[3];
+    for record in [attempt_failed, request_failed] {
+        assert_eq!(record["failure_kind"], "provider_or_transport_failure");
+        assert_eq!(record["failure_reason"], "provider_or_transport_failure");
+        assert_eq!(
+            record["logical_request_id"],
+            starts[0]["logical_request_id"]
+        );
+        assert_eq!(record["request_index"], starts[0]["request_index"]);
+    }
+    // A failed attempt must not be billed as free: billability stays unknown.
+    assert!(
+        attempt_failed["billable"].is_null(),
+        "a failed attempt must not claim a billing outcome: {attempt_failed:?}"
+    );
+
+    // The compaction/reset linkage is stamped at decision time, before the summary
+    // runs, so it necessarily survives the failure. It survives only as the
+    // *intended* linkage: the terminal records must carry exactly the decision-time
+    // identity and must not rewrite, advance, or fabricate a successful one. Real
+    // evidence of a completed compaction would be a `request_completed` or a
+    // `compact_feedback`, both of which are asserted absent above and below.
+    let compaction_id = starts[0]["compaction_id"]
+        .as_str()
+        .expect("a policy COMPACT records its intended compaction linkage");
+    let reset_id = starts[0]["reset_id"]
+        .as_str()
+        .expect("a policy COMPACT records its intended reset linkage");
+    assert!(
+        compaction_id.ends_with(":compact:0"),
+        "the intended compaction linkage must stay at the decision epoch: {compaction_id}"
+    );
+    assert!(
+        reset_id.ends_with(":reset:0"),
+        "the intended reset linkage must stay at the decision epoch: {reset_id}"
+    );
+    for record in [attempt_failed, request_failed] {
+        assert!(
+            record["provider_usage"].is_null(),
+            "a failed summary has no provider usage to report: {record:?}"
+        );
+        assert_eq!(record["compaction_id"], starts[0]["compaction_id"]);
+        assert_eq!(record["reset_id"], starts[0]["reset_id"]);
+    }
+}
+
+/// Build a codex session bound to a TCP policy fixture.
+async fn tcp_policy_codex(server: &MockServer, policy: ContextPolicyConfig) -> TestCodex {
+    let model_provider = non_openai_model_provider(server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        config.experimental_context_policy = policy;
+    });
+    builder.build(server).await.expect("build test codex")
+}
+
+async fn submit_tcp_turn(codex: &Arc<codex_core::CodexThread>, prompt: &str) {
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: prompt.into(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit user turn");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_accumulator_malformed_decision_issues_no_provider_request() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let policy_dir = TempDir::new().expect("create policy fixture directory");
+    let policy_path = policy_dir.path().join("tcp-malformed-policy.jsonl");
+    let raw_log_path =
+        AbsolutePathBuf::from_absolute_path(&policy_path).expect("policy log is absolute");
+    let (policy, _) = tcp_bridge_fixture(&policy_dir, raw_log_path, "malformed_decide");
+    let test = tcp_policy_codex(&server, policy).await;
+
+    // A decision response the host cannot parse must fail the turn closed: no
+    // silent KEEP, no native compact, no refresh, and no provider request.
+    submit_tcp_turn(&test.codex, "tcp malformed decision").await;
+    let event = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::Error(_) | EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert!(
+        matches!(event, EventMsg::Error(_)),
+        "a malformed decision must surface an error instead of completing normally"
+    );
+    let _ = test.codex.submit(Op::Shutdown).await;
+
+    let served = server
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .into_iter()
+        .filter(|request| request.url.path() == "/v1/responses")
+        .count();
+    assert_eq!(
+        served, 0,
+        "a malformed decision must not reach the provider at all"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_accumulator_failed_compact_feedback_is_fail_closed() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let summary_turn = sse(vec![
+        ev_assistant_message("m-tcp-fail-summary", SUMMARY_TEXT),
+        ev_completed_with_tokens("r-tcp-fail-summary", /*total_tokens*/ 10),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![summary_turn]).await;
+
+    let policy_dir = TempDir::new().expect("create policy fixture directory");
+    let policy_path = policy_dir.path().join("tcp-feedback-failure-policy.jsonl");
+    let raw_log_path =
+        AbsolutePathBuf::from_absolute_path(&policy_path).expect("policy log is absolute");
+    let (policy, protocol_log) = tcp_bridge_fixture(&policy_dir, raw_log_path, "feedback_failure");
+    let test = tcp_policy_codex(&server, policy).await;
+
+    // A rejected compact feedback must abort the invocation: the host must not
+    // silently serve the rebuilt context as though a reset had been recorded.
+    submit_tcp_turn(&test.codex, "tcp feedback failure").await;
+    let event = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::Error(_) | EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert!(
+        matches!(event, EventMsg::Error(_)),
+        "a rejected compact feedback must surface an error"
+    );
+    let _ = test.codex.submit(Op::Shutdown).await;
+
+    assert_eq!(
+        request_log.requests().len(),
+        1,
+        "the summary request may precede the failure, but nothing after it"
+    );
+    let protocol = read_bridge_protocol(&protocol_log);
+    let kinds = protocol
+        .iter()
+        .map(|event| event["type"].as_str().expect("event type"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec!["initialize", "decide", "compact_feedback"],
+        "a failed feedback must not be followed by terminal/shutdown success"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_accumulator_failed_terminal_is_reported_at_shutdown() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let serve_turn = sse(vec![
+        ev_assistant_message("m-tcp-terminal-serve", FINAL_REPLY),
+        ev_completed_with_tokens("r-tcp-terminal-serve", /*total_tokens*/ 10),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![serve_turn]).await;
+
+    let policy_dir = TempDir::new().expect("create policy fixture directory");
+    let policy_path = policy_dir.path().join("tcp-terminal-failure-policy.jsonl");
+    let raw_log_path =
+        AbsolutePathBuf::from_absolute_path(&policy_path).expect("policy log is absolute");
+    let (policy, _) = tcp_bridge_fixture(&policy_dir, raw_log_path, "terminal_failure");
+    let test = tcp_policy_codex(&server, policy).await;
+
+    test.submit_text_turn("tcp terminal failure")
+        .await
+        .expect("KEEP epoch should serve normally");
+    assert_eq!(request_log.requests().len(), 1);
+    let _ = test.codex.submit(Op::Shutdown).await;
+    let event = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::Error(_) | EventMsg::ShutdownComplete)
+    })
+    .await;
+    assert!(
+        matches!(event, EventMsg::Error(_)),
+        "a failed terminal must be reported instead of a shutdown success"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn controlled_fixed_and_external_stub_use_the_native_compactor_and_rebuild_context() {
     skip_if_no_network!();
 
@@ -2556,6 +3417,7 @@ async fn controlled_fixed_and_external_stub_use_the_native_compactor_and_rebuild
                     controlled_compact_at_epoch_zero(policy_path_absolute)
                 }
                 ContextPolicyMode::NativeFixed
+                | ContextPolicyMode::TcpAccumulator
                 | ContextPolicyMode::MpcH1
                 | ContextPolicyMode::Mpc => unreachable!(),
             };

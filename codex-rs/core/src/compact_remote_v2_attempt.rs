@@ -12,6 +12,7 @@ use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use codex_history::CodexHarnessMetadata;
+use codex_protocol::ResponseUsageMetadata;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
@@ -25,6 +26,9 @@ pub(super) struct RemoteCompactV2Attempt {
     pub(super) compaction_output: ResponseItem,
     pub(super) compaction_response_id: String,
     pub(super) token_usage: Option<TokenUsage>,
+    /// Raw upstream usage object, preserved so the request ledger can record
+    /// which fields the provider actually reported.
+    pub(super) usage_metadata: Option<ResponseUsageMetadata>,
     /// Keeps a session created for standalone compaction alive through lifecycle completion.
     pub(super) owned_client_session: Option<ModelClientSession>,
 }
@@ -122,6 +126,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
         compaction_output,
         response_id,
         token_usage,
+        usage_metadata,
     } = compaction_output_result?;
     let mut prompt_input = prompt.input;
     prompt_input.pop();
@@ -132,6 +137,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
         compaction_output,
         compaction_response_id: response_id,
         token_usage,
+        usage_metadata,
         owned_client_session,
     })
 }

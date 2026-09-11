@@ -42,6 +42,7 @@ use codex_context_fragments::set_annotated_content;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::ResponseItemId;
+use codex_protocol::ResponseUsageMetadata;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
@@ -327,6 +328,7 @@ async fn run_compact_task_inner_impl(
                             request,
                             Some(&response.response_id),
                             response.token_usage.as_ref(),
+                            response.usage_metadata.as_ref(),
                             Some(response.visible_output_tokens),
                             "completed",
                             None,
@@ -989,6 +991,7 @@ async fn drain_to_completed(
                 return Ok(CompactResponse {
                     response_id,
                     token_usage,
+                    usage_metadata,
                     visible_output_tokens,
                 });
             }
@@ -1001,6 +1004,9 @@ async fn drain_to_completed(
 struct CompactResponse {
     response_id: String,
     token_usage: Option<TokenUsage>,
+    /// Raw upstream usage object, preserved so the request ledger can record
+    /// which fields the provider actually reported.
+    usage_metadata: Option<ResponseUsageMetadata>,
     visible_output_tokens: i64,
 }
 
