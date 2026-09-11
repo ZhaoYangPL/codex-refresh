@@ -3159,6 +3159,78 @@ async fn tcp_accumulator_failed_compact_summary_is_fail_closed() {
             .any(|record| record["request_purpose"] == "serve"),
         "no normal serve may be logged after a failed summary: {request_records:?}"
     );
+
+    // The whole ledger lifecycle of the failed summary, in order. `stream_max_retries
+    // = 0` makes the very first failure terminal, so the run must record the start,
+    // the attempt, the attempt failure, and the request-level failure — and then
+    // stop. `retry_scheduled` would mean a second attempt was queued, which would
+    // also violate the single-provider-request assertion above.
+    let events = request_records
+        .iter()
+        .map(|record| record["event"].as_str().expect("ledger event name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events,
+        vec![
+            "request_started",
+            "attempt_started",
+            "attempt_failed",
+            "request_failed",
+        ],
+        "a failed summary must terminate its ledger lifecycle without completing: {request_records:?}"
+    );
+    assert!(
+        !events.contains(&"request_completed"),
+        "no request_completed may exist for a failed summary: {events:?}"
+    );
+
+    // The terminal records keep the accepted typed failure semantics rather than
+    // degrading to an untyped or optimistic outcome.
+    let attempt_failed = &request_records[2];
+    let request_failed = &request_records[3];
+    for record in [attempt_failed, request_failed] {
+        assert_eq!(record["failure_kind"], "provider_or_transport_failure");
+        assert_eq!(record["failure_reason"], "provider_or_transport_failure");
+        assert_eq!(
+            record["logical_request_id"],
+            starts[0]["logical_request_id"]
+        );
+        assert_eq!(record["request_index"], starts[0]["request_index"]);
+    }
+    // A failed attempt must not be billed as free: billability stays unknown.
+    assert!(
+        attempt_failed["billable"].is_null(),
+        "a failed attempt must not claim a billing outcome: {attempt_failed:?}"
+    );
+
+    // The compaction/reset linkage is stamped at decision time, before the summary
+    // runs, so it necessarily survives the failure. It survives only as the
+    // *intended* linkage: the terminal records must carry exactly the decision-time
+    // identity and must not rewrite, advance, or fabricate a successful one. Real
+    // evidence of a completed compaction would be a `request_completed` or a
+    // `compact_feedback`, both of which are asserted absent above and below.
+    let compaction_id = starts[0]["compaction_id"]
+        .as_str()
+        .expect("a policy COMPACT records its intended compaction linkage");
+    let reset_id = starts[0]["reset_id"]
+        .as_str()
+        .expect("a policy COMPACT records its intended reset linkage");
+    assert!(
+        compaction_id.ends_with(":compact:0"),
+        "the intended compaction linkage must stay at the decision epoch: {compaction_id}"
+    );
+    assert!(
+        reset_id.ends_with(":reset:0"),
+        "the intended reset linkage must stay at the decision epoch: {reset_id}"
+    );
+    for record in [attempt_failed, request_failed] {
+        assert!(
+            record["provider_usage"].is_null(),
+            "a failed summary has no provider usage to report: {record:?}"
+        );
+        assert_eq!(record["compaction_id"], starts[0]["compaction_id"]);
+        assert_eq!(record["reset_id"], starts[0]["reset_id"]);
+    }
 }
 
 /// Build a codex session bound to a TCP policy fixture.
