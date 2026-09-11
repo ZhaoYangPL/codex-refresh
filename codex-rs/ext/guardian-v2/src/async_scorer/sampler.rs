@@ -311,6 +311,10 @@ impl LunaSampler {
             service_tier: None,
             prompt_cache_key: Some(format!("guardian-v2:{}", self.config.thread_id)),
             text: None,
+            // The scorer is its own caller and must not adopt a caller's
+            // end-user identity: this request is not part of the run whose
+            // cache isolation that identity exists to establish.
+            user: None,
             client_metadata: None,
             access_programs: None,
         };
