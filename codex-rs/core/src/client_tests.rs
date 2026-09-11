@@ -1569,12 +1569,7 @@ fn frozen_request_shaping_configuration_is_identical_across_all_five_arms() {
 
         let projection: Vec<(String, Option<serde_json::Value>)> = REQUEST_SHAPING_FIELDS
             .iter()
-            .map(|field| {
-                (
-                    field.to_string(),
-                    body.get(*field).cloned(),
-                )
-            })
+            .map(|field| (field.to_string(), body.get(*field).cloned()))
             .collect();
 
         match &baseline {
@@ -1589,7 +1584,10 @@ fn frozen_request_shaping_configuration_is_identical_across_all_five_arms() {
 
     let projection = baseline.expect("at least one arm was checked");
     // Guard against a vacuous pass: the projection must carry real values.
-    let present = projection.iter().filter(|(_, value)| value.is_some()).count();
+    let present = projection
+        .iter()
+        .filter(|(_, value)| value.is_some())
+        .count();
     assert!(
         present >= REQUEST_SHAPING_FIELDS.len() - 1,
         "the request-shaping projection is mostly empty, so the comparison proves nothing"
