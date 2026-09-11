@@ -366,7 +366,7 @@ async fn schedule_startup_prewarm_inner(
                 (session.request_ledger.as_ref(), raw_request.as_ref())
             {
                 ledger
-                    .completed(request, None, None, Some(0), "warmup_completed", None)
+                    .completed(request, None, None, None, Some(0), "warmup_completed", None)
                     .await?;
             }
         }

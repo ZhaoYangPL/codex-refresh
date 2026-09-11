@@ -344,6 +344,9 @@ async fn run_remote_compact_task_inner_impl(
                 request,
                 None,
                 None,
+                // Remote compaction v1 does not surface the upstream usage
+                // object, so field presence stays unrecorded rather than guessed.
+                None,
                 Some(visible_output_tokens),
                 "completed",
                 Some(&terminal_identity),

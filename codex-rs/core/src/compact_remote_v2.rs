@@ -43,6 +43,7 @@ use codex_context_fragments::to_annotated_content;
 use codex_features::Feature;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
+use codex_protocol::ResponseUsageMetadata;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
@@ -367,6 +368,7 @@ async fn run_remote_compact_task_inner_impl(
         compaction_output,
         compaction_response_id,
         token_usage,
+        usage_metadata,
         owned_client_session: _owned_client_session,
     } = attempt;
     if let (Some(ledger), Some(request)) = (sess.request_ledger.as_ref(), raw_request.as_ref()) {
@@ -383,6 +385,7 @@ async fn run_remote_compact_task_inner_impl(
                 request,
                 Some(&compaction_response_id),
                 token_usage.as_ref(),
+                usage_metadata.as_ref(),
                 Some(visible_output_tokens),
                 "completed",
                 Some(&terminal_identity),
@@ -454,6 +457,9 @@ struct RemoteCompactionV2Output {
     compaction_output: ResponseItem,
     response_id: String,
     token_usage: Option<TokenUsage>,
+    /// Raw upstream usage object, preserved so the request ledger can record
+    /// which fields the provider actually reported.
+    usage_metadata: Option<ResponseUsageMetadata>,
 }
 
 struct RawCompactionAttemptState<'a> {
@@ -607,6 +613,7 @@ async fn collect_compaction_output(
     let mut compaction_output = None;
     let mut completed_response_id = None;
     let mut completed_token_usage = None;
+    let mut completed_usage_metadata = None;
     while let Some(event) = stream.next().await {
         match event? {
             ResponseEvent::OutputItemDone(item) => {
@@ -633,6 +640,7 @@ async fn collect_compaction_output(
                 .await;
                 completed_response_id = Some(response_id);
                 completed_token_usage = token_usage;
+                completed_usage_metadata = usage_metadata;
                 break;
             }
             _ => {}
@@ -658,6 +666,7 @@ async fn collect_compaction_output(
         compaction_output,
         response_id,
         token_usage: completed_token_usage,
+        usage_metadata: completed_usage_metadata,
     })
 }
 
