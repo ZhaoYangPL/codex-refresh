@@ -1305,6 +1305,13 @@
           "type": "string"
         },
         {
+          "description": "Invoke the accepted TCP / adaptive-accumulator baseline through the Phase 8B bridge.\n\nSits between the fixed threshold and the MPC arm in the formal timing ladder.  It shares the bridge, the compact-feedback exchange, and the formal L/K/W observation path with the MPC arms, but it is not an MPC mode: it uses no horizon, no scenario sampling, and no recovery model.",
+          "enum": [
+            "tcp_accumulator"
+          ],
+          "type": "string"
+        },
+        {
           "description": "Invoke the accepted controller through the Phase 8B bridge with H=1.",
           "enum": [
             "mpc_h1"

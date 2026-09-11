@@ -71,6 +71,13 @@ pub enum ContextPolicyMode {
     ControlledFixed,
     /// Use a deterministic in-process stand-in for a future external policy bridge.
     ExternalStub,
+    /// Invoke the accepted TCP / adaptive-accumulator baseline through the Phase 8B bridge.
+    ///
+    /// Sits between the fixed threshold and the MPC arm in the formal timing
+    /// ladder.  It shares the bridge, the compact-feedback exchange, and the
+    /// formal L/K/W observation path with the MPC arms, but it is not an MPC
+    /// mode: it uses no horizon, no scenario sampling, and no recovery model.
+    TcpAccumulator,
     /// Invoke the accepted controller through the Phase 8B bridge with H=1.
     MpcH1,
     /// Invoke the accepted controller through the Phase 8B bridge with frozen H>1.

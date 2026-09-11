@@ -178,6 +178,30 @@ pub(crate) fn validate_config(
                 ));
             }
         },
+        ContextPolicyMode::TcpAccumulator => {
+            // TCP shares the bridge transport and the formal L/K/W observation
+            // path, but it owns no scenario RNG and no recovery model.  `seed`
+            // and `recovery_artifact_id` are therefore neither required nor
+            // consulted for this mode; if the shared run manifest carries them
+            // they remain provenance only.
+            if config.bridge_command.is_none()
+                || config.bridge_timeout_ms.is_none_or(|value| value == 0)
+                || config
+                    .controller_config_id
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                || config.z_schema_version.as_deref() != Some(Z_SCHEMA_VERSION)
+            {
+                return Err(invalid(
+                    "tcp_accumulator bridge configuration is incomplete",
+                ));
+            }
+            if config.fixed_threshold_tokens.is_some() || config.external_stub.is_some() {
+                return Err(invalid(
+                    "tcp_accumulator cannot include fixed/stub policy settings",
+                ));
+            }
+        }
         ContextPolicyMode::MpcH1 | ContextPolicyMode::Mpc => {
             let identities = [
                 config.controller_config_id.as_deref(),
@@ -200,6 +224,41 @@ pub(crate) fn validate_config(
         }
     }
     Ok(())
+}
+
+/// Capability predicates over the policy mode.
+///
+/// The controlled modes deliberately do not form one lump.  The TCP baseline
+/// shares the bridge transport, the compact-feedback exchange, the formal
+/// reusable-prefix observation, and the persistent-process teardown with the
+/// MPC arms, while sharing none of their prediction machinery.  Each capability
+/// is therefore stated separately rather than widening a single MPC test, so
+/// that a future mode can opt into exactly the ones it needs.
+fn uses_external_bridge(mode: ContextPolicyMode) -> bool {
+    matches!(
+        mode,
+        ContextPolicyMode::TcpAccumulator | ContextPolicyMode::MpcH1 | ContextPolicyMode::Mpc
+    )
+}
+
+/// Modes that must report the realized post-COMPACT length back to the policy.
+fn needs_compact_feedback(mode: ContextPolicyMode) -> bool {
+    uses_external_bridge(mode)
+}
+
+/// Modes whose persistent bridge process is closed by `terminal`/`shutdown`.
+fn needs_bridge_terminal_shutdown(mode: ContextPolicyMode) -> bool {
+    uses_external_bridge(mode)
+}
+
+/// Modes that observe and log the formal reusable prefix `K_t`.
+fn uses_formal_prefix_state_k(mode: ContextPolicyMode) -> bool {
+    uses_external_bridge(mode)
+}
+
+/// Modes that build future workload scenarios, a horizon, or a recovery model.
+fn uses_workload_prediction(mode: ContextPolicyMode) -> bool {
+    matches!(mode, ContextPolicyMode::MpcH1 | ContextPolicyMode::Mpc)
 }
 
 pub(crate) fn native_context_limit_enabled(config: &ContextPolicyConfig) -> bool {
@@ -279,13 +338,6 @@ impl ContextPolicySeam {
         }
     }
 
-    fn is_mpc(&self) -> bool {
-        matches!(
-            self.config.mode,
-            ContextPolicyMode::MpcH1 | ContextPolicyMode::Mpc
-        )
-    }
-
     pub(crate) async fn decide(
         &mut self,
         epoch: u64,
@@ -322,7 +374,11 @@ impl ContextPolicySeam {
                 None,
                 "external_stub".to_string(),
             ),
-            ContextPolicyMode::MpcH1 | ContextPolicyMode::Mpc => {
+            // The TCP baseline and the MPC arms share one seam: same bridge
+            // handshake, same formal L/K/W state message, same response parser.
+            ContextPolicyMode::TcpAccumulator
+            | ContextPolicyMode::MpcH1
+            | ContextPolicyMode::Mpc => {
                 self.initialize_bridge(epoch, &observation).await?;
                 self.send_transition(epoch, &observation).await?;
                 let window = observation
@@ -368,7 +424,9 @@ impl ContextPolicySeam {
         observation: ContextPolicyObservation,
     ) -> io::Result<()> {
         let observation = observation.with_prefix(self.previous_ready.as_ref());
-        if self.is_mpc() && decision.action == Some(ContextPolicyAction::Compact) {
+        if needs_compact_feedback(self.config.mode)
+            && decision.action == Some(ContextPolicyAction::Compact)
+        {
             let request = self.message(
                 "compact_feedback",
                 decision.epoch,
@@ -398,7 +456,7 @@ impl ContextPolicySeam {
     }
 
     pub(crate) async fn terminal(&mut self, epoch: u64, reason: &str) -> io::Result<()> {
-        if !self.is_mpc() || !self.bridge_initialized {
+        if !needs_bridge_terminal_shutdown(self.config.mode) || !self.bridge_initialized {
             return Ok(());
         }
         let observation = self
@@ -449,10 +507,18 @@ impl ContextPolicySeam {
         }
         self.bridge = Some(ContextPolicyBridge::spawn(&self.config)?);
         let mode = match self.config.mode {
+            ContextPolicyMode::TcpAccumulator => "tcp_accumulator",
             ContextPolicyMode::MpcH1 => "mpc_h1",
             ContextPolicyMode::Mpc => "mpc",
             _ => unreachable!(),
         };
+        // Only modes that build future workload scenarios consult a recovery
+        // model, so only they declare a frozen recovery artifact.  For the TCP
+        // baseline the field is sent as null: a value carried by the shared run
+        // manifest must never look like a dependency.
+        let recovery_artifact_id = uses_workload_prediction(self.config.mode)
+            .then(|| self.config.recovery_artifact_id.clone())
+            .flatten();
         let request = self.message(
             "initialize",
             epoch,
@@ -460,7 +526,7 @@ impl ContextPolicySeam {
             serde_json::json!({"controller_mode": mode, "model_id": observation.model_id,
                 "provider_id": observation.provider_id, "seed": self.config.seed,
                 "controller_config_id": self.config.controller_config_id,
-                "recovery_artifact_id": self.config.recovery_artifact_id,
+                "recovery_artifact_id": recovery_artifact_id,
                 "z_schema_version": self.config.z_schema_version}),
         );
         let response = self.exchange(&request).await?;
@@ -558,7 +624,7 @@ impl ContextPolicySeam {
         observation: &ContextPolicyObservation,
     ) -> Value {
         serde_json::json!({"event": event,
-            "protocol_version": if self.is_mpc() { PROTOCOL_VERSION } else { PHASE8A_PROTOCOL_VERSION },
+            "protocol_version": if uses_external_bridge(self.config.mode) { PROTOCOL_VERSION } else { PHASE8A_PROTOCOL_VERSION },
             "run_id": self.run_id(), "task_id": self.task_id(), "replicate_id": self.replicate_id(),
             "thread_id": observation.thread_id, "turn_id": observation.turn_id, "epoch": decision.epoch,
             "policy_mode": self.config.mode, "action": decision.action,
@@ -566,7 +632,8 @@ impl ContextPolicySeam {
             "compaction_reason": (decision.action == Some(ContextPolicyAction::Compact)).then_some("context_limit"),
             "estimated_input_tokens": observation.estimated_input_tokens,
             "formal_input_tokens": observation.formal_input_tokens,
-            "reusable_prefix_tokens": self.is_mpc().then_some(observation.reusable_prefix_tokens),
+            "reusable_prefix_tokens": uses_formal_prefix_state_k(self.config.mode)
+                .then_some(observation.reusable_prefix_tokens),
             "nominal_context_window": observation.nominal_context_window,
             "usable_context_window": observation.usable_context_window,
             "input_item_count": observation.input_item_count,

@@ -465,6 +465,7 @@ fn arm_name(mode: ContextPolicyMode) -> &'static str {
         ContextPolicyMode::NativeFixed => "native_fixed",
         ContextPolicyMode::ControlledFixed => "controlled_fixed",
         ContextPolicyMode::ExternalStub => "external_stub",
+        ContextPolicyMode::TcpAccumulator => "tcp_accumulator",
         ContextPolicyMode::MpcH1 => "mpc_h1",
         ContextPolicyMode::Mpc => "mpc",
     }
@@ -955,6 +956,31 @@ mod tests {
             .expect("resume")
             .expect("enabled");
         drop(resumed);
+    }
+
+    #[test]
+    fn every_policy_mode_maps_to_its_own_frozen_ledger_arm() {
+        // The arm is part of the frozen run identity, so each formal V1 rollout
+        // arm must be distinguishable inside one ledger stream.
+        assert_eq!(
+            [
+                ContextPolicyMode::NativeFixed,
+                ContextPolicyMode::ControlledFixed,
+                ContextPolicyMode::ExternalStub,
+                ContextPolicyMode::TcpAccumulator,
+                ContextPolicyMode::MpcH1,
+                ContextPolicyMode::Mpc,
+            ]
+            .map(arm_name),
+            [
+                "native_fixed",
+                "controlled_fixed",
+                "external_stub",
+                "tcp_accumulator",
+                "mpc_h1",
+                "mpc"
+            ]
+        );
     }
 
     #[test]

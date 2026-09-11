@@ -11,7 +11,12 @@ use super::ContextPolicyAction;
 use super::ContextPolicyObservation;
 use super::ContextPolicySeam;
 use super::native_context_limit_enabled;
+use super::needs_bridge_terminal_shutdown;
+use super::needs_compact_feedback;
 use super::parse_bridge_decision;
+use super::uses_external_bridge;
+use super::uses_formal_prefix_state_k;
+use super::uses_workload_prediction;
 use super::validate_config;
 use crate::Prompt;
 
@@ -33,6 +38,27 @@ fn controlled_config(
         task_id: Some("task-1".to_string()),
         replicate_id: Some(2),
         raw_log_path: Some(raw_log_path),
+        ..Default::default()
+    }
+}
+
+/// A TCP run manifest that carries only what the TCP arm actually needs.
+///
+/// `seed` and `recovery_artifact_id` are deliberately absent: TCP owns no
+/// scenario RNG and no recovery model, so neither may be required.
+fn tcp_config(raw_log_path: AbsolutePathBuf) -> ContextPolicyConfig {
+    ContextPolicyConfig {
+        mode: ContextPolicyMode::TcpAccumulator,
+        run_id: Some("run-1".to_string()),
+        task_id: Some("task-1".to_string()),
+        replicate_id: Some(2),
+        raw_log_path: Some(raw_log_path),
+        bridge_command: Some(absolute(
+            std::env::current_exe().expect("current exe").as_path(),
+        )),
+        bridge_timeout_ms: Some(1_000),
+        controller_config_id: Some("fixture-controller-v1".to_string()),
+        z_schema_version: Some("phase4-observable-v1".to_string()),
         ..Default::default()
     }
 }
@@ -209,4 +235,147 @@ fn controlled_configuration_is_fail_closed() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn tcp_shares_bridge_capabilities_but_is_not_an_mpc_mode() {
+    for mode in [
+        ContextPolicyMode::TcpAccumulator,
+        ContextPolicyMode::MpcH1,
+        ContextPolicyMode::Mpc,
+    ] {
+        assert!(uses_external_bridge(mode), "{mode:?} uses the bridge");
+        assert!(needs_compact_feedback(mode), "{mode:?} needs feedback");
+        assert!(
+            needs_bridge_terminal_shutdown(mode),
+            "{mode:?} needs teardown"
+        );
+        assert!(
+            uses_formal_prefix_state_k(mode),
+            "{mode:?} observes the formal reusable prefix"
+        );
+    }
+
+    // Only the MPC arms predict future workload.
+    assert!(!uses_workload_prediction(ContextPolicyMode::TcpAccumulator));
+    assert!(uses_workload_prediction(ContextPolicyMode::MpcH1));
+    assert!(uses_workload_prediction(ContextPolicyMode::Mpc));
+
+    for mode in [
+        ContextPolicyMode::NativeFixed,
+        ContextPolicyMode::ControlledFixed,
+        ContextPolicyMode::ExternalStub,
+    ] {
+        assert!(!uses_external_bridge(mode), "{mode:?} is in-process");
+        assert!(!needs_compact_feedback(mode));
+        assert!(!needs_bridge_terminal_shutdown(mode));
+        assert!(!uses_formal_prefix_state_k(mode));
+        assert!(!uses_workload_prediction(mode));
+    }
+}
+
+#[test]
+fn tcp_accumulator_bridge_configuration_is_fail_closed() {
+    let directory = tempfile::tempdir().expect("create temp dir");
+    let path = absolute(&directory.path().join("tcp.jsonl"));
+    let valid = tcp_config(path);
+    assert!(validate_config(&valid, /*token_budget_enabled*/ false).is_ok());
+    assert!(validate_config(&valid, /*token_budget_enabled*/ true).is_err());
+
+    let cases: Vec<(&str, ContextPolicyConfig)> = vec![
+        (
+            "bridge_command",
+            ContextPolicyConfig {
+                bridge_command: None,
+                ..valid.clone()
+            },
+        ),
+        (
+            "controller_config_id",
+            ContextPolicyConfig {
+                controller_config_id: None,
+                ..valid.clone()
+            },
+        ),
+        (
+            "z_schema_version",
+            ContextPolicyConfig {
+                z_schema_version: Some("invented-v1".to_string()),
+                ..valid.clone()
+            },
+        ),
+        (
+            "timeout",
+            ContextPolicyConfig {
+                bridge_timeout_ms: Some(0),
+                ..valid.clone()
+            },
+        ),
+        (
+            "fixed_threshold_tokens",
+            ContextPolicyConfig {
+                fixed_threshold_tokens: Some(10),
+                ..valid.clone()
+            },
+        ),
+        (
+            "external_stub",
+            ContextPolicyConfig {
+                external_stub: Some(ExternalContextPolicyStub::AlwaysKeep),
+                ..valid
+            },
+        ),
+    ];
+    for (name, config) in cases {
+        assert!(
+            validate_config(&config, /*token_budget_enabled*/ false).is_err(),
+            "tcp_accumulator must reject an incomplete/inconsistent config ({name})"
+        );
+    }
+}
+
+#[test]
+fn tcp_accumulator_does_not_require_mpc_only_provenance() {
+    let directory = tempfile::tempdir().expect("create temp dir");
+    let path = absolute(&directory.path().join("tcp-provenance.jsonl"));
+    let tcp = tcp_config(path);
+    assert!(tcp.seed.is_none() && tcp.recovery_artifact_id.is_none());
+
+    // A shared run manifest may still carry both; they stay provenance only.
+    let carrying = ContextPolicyConfig {
+        seed: Some(7),
+        recovery_artifact_id: Some("fixture-recovery-v1".to_string()),
+        ..tcp.clone()
+    };
+    assert!(validate_config(&carrying, /*token_budget_enabled*/ false).is_ok());
+
+    // The relaxation is TCP-specific: an MPC arm still requires both.
+    let mpc_base = ContextPolicyConfig {
+        mode: ContextPolicyMode::MpcH1,
+        seed: Some(7),
+        recovery_artifact_id: Some("fixture-recovery-v1".to_string()),
+        ..tcp
+    };
+    assert!(validate_config(&mpc_base, /*token_budget_enabled*/ false).is_ok());
+    for (name, config) in [
+        (
+            "seed",
+            ContextPolicyConfig {
+                seed: None,
+                ..mpc_base.clone()
+            },
+        ),
+        (
+            "recovery_artifact_id",
+            ContextPolicyConfig {
+                recovery_artifact_id: None,
+                ..mpc_base
+            },
+        ),
+    ] {
+        assert!(
+            validate_config(&config, /*token_budget_enabled*/ false).is_err(),
+            "MPC bridge configuration must still require {name}"
+        );
+    }
 }
