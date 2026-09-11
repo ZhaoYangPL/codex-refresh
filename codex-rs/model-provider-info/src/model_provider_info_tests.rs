@@ -20,6 +20,7 @@ base_url = "http://localhost:11434/v1"
         auth: None,
         aws: None,
         wire_api: WireApi::Responses,
+        user_id: None,
         query_params: None,
         http_headers: None,
         env_http_headers: None,
@@ -53,6 +54,7 @@ query_params = { api-version = "2025-04-01-preview" }
         auth: None,
         aws: None,
         wire_api: WireApi::Responses,
+        user_id: None,
         query_params: Some(maplit::hashmap! {
             "api-version".to_string() => "2025-04-01-preview".into(),
         }),
@@ -90,6 +92,7 @@ supports_standalone_web_search = true
         auth: None,
         aws: None,
         wire_api: WireApi::Responses,
+        user_id: None,
         query_params: None,
         http_headers: Some(maplit::hashmap! {
             "X-Example-Header".to_string() => "example-value".into(),
@@ -134,6 +137,80 @@ supports_websockets = true
 
     let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
     assert_eq!(provider.websocket_connect_timeout_ms, Some(15_000));
+}
+
+#[test]
+fn test_deserialize_provider_cache_isolation_identity() {
+    let provider_toml = r#"
+name = "DeepSeek"
+base_url = "https://api.deepseek.com"
+env_key = "DEEPSEEK_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+user_id = "phase8d_native_fixed_r01"
+        "#;
+
+    let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
+    assert_eq!(
+        provider.user_id,
+        Some("phase8d_native_fixed_r01".to_string())
+    );
+}
+
+#[test]
+fn test_deserialize_provider_without_cache_isolation_identity_defaults_to_none() {
+    let provider_toml = r#"
+name = "DeepSeek"
+base_url = "https://api.deepseek.com"
+env_key = "DEEPSEEK_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+        "#;
+
+    let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
+    assert_eq!(provider.user_id, None);
+}
+
+#[test]
+fn test_distinct_arm_configs_never_parse_to_one_cache_isolation_identity() {
+    // The five Phase 8D arms differ ONLY in this field, so parsing must not
+    // collapse any two of them onto the same provider-side cache identity.
+    let arm_configs = [
+        ("native_fixed", "phase8d_native_fixed_r01"),
+        ("controlled_fixed", "phase8d_controlled_fixed_r01"),
+        ("tcp_accumulator", "phase8d_tcp_accumulator_r01"),
+        ("mpc_h1", "phase8d_mpc_h1_r01"),
+        ("mpc", "phase8d_mpc_r01"),
+    ];
+
+    let mut seen: Vec<String> = Vec::new();
+    for (arm, user_id) in arm_configs {
+        let provider_toml = format!(
+            r#"
+name = "DeepSeek"
+base_url = "https://api.deepseek.com"
+env_key = "DEEPSEEK_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+user_id = "{user_id}"
+        "#
+        );
+
+        let provider: ModelProviderInfo =
+            toml::from_str(&provider_toml).unwrap_or_else(|err| panic!("{arm} config: {err}"));
+        let parsed = provider
+            .user_id
+            .unwrap_or_else(|| panic!("{arm} config dropped its cache isolation identity"));
+
+        assert_eq!(parsed, user_id, "{arm} config parsed the wrong identity");
+        assert!(
+            !seen.contains(&parsed),
+            "{arm} shares its cache isolation identity with another arm"
+        );
+        seen.push(parsed);
+    }
+
+    assert_eq!(seen.len(), 5);
 }
 
 #[test]
@@ -268,6 +345,7 @@ fn test_create_amazon_bedrock_provider() {
                 auth_refresh: None,
             }),
             wire_api: WireApi::Responses,
+            user_id: None,
             query_params: None,
             http_headers: Some(maplit::hashmap! {
                 AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER.to_string() =>

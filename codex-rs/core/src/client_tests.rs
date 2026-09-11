@@ -1349,3 +1349,249 @@ async fn non_chatgpt_codex_endpoints_omit_attestation_generation() {
     );
     assert_eq!(attestation_calls.load(Ordering::Relaxed), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Provider-side cache isolation identity (Phase 8D).
+//
+// DeepSeek documents the Responses `user` field as the KV-cache isolation key.
+// One stable value per experiment arm keeps within-arm cache reuse real while
+// stopping arms from sharing cached prefixes, so the value has to reach the
+// request body from provider config -- and it has to reach the compaction
+// summary body too, not just the ordinary serve body.
+// ---------------------------------------------------------------------------
+
+fn test_model_client_with_provider(provider: ModelProviderInfo) -> ModelClient {
+    ModelClient::new(
+        /*auth_manager*/ None,
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        provider,
+        SessionSource::Cli,
+        "test_originator".to_string(),
+        /*model_verbosity*/ None,
+        /*content_item_kinds_enabled*/ true,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    )
+}
+
+fn build_test_responses_request(client: &ModelClient) -> codex_api::ResponsesApiRequest {
+    let model = test_model_info();
+    client
+        .build_responses_request(
+            &Prompt::default(),
+            &model,
+            /*effort*/ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            /*service_tier*/ None,
+            &test_responses_metadata_for_client(
+                client,
+                /*turn_id*/ None,
+                format!("{}:0", client.state.thread_id),
+                /*parent_thread_id*/ None,
+                TestCodexResponsesRequestKind::Turn,
+            ),
+        )
+        .expect("build responses request")
+}
+
+fn provider_with_user_id(user_id: Option<&str>) -> ModelProviderInfo {
+    let mut provider =
+        create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses);
+    provider.user_id = user_id.map(str::to_string);
+    provider
+}
+
+#[test]
+fn responses_request_carries_the_provider_cache_isolation_identity() {
+    let client =
+        test_model_client_with_provider(provider_with_user_id(Some("phase8d_tcp_accumulator_r01")));
+
+    let request = build_test_responses_request(&client);
+    assert_eq!(request.user.as_deref(), Some("phase8d_tcp_accumulator_r01"));
+
+    let body = serde_json::to_value(&request).expect("serialize request body");
+    assert_eq!(
+        body.get("user").and_then(|value| value.as_str()),
+        Some("phase8d_tcp_accumulator_r01"),
+    );
+}
+
+#[test]
+fn responses_request_omits_user_when_provider_declares_none() {
+    let client = test_model_client_with_provider(provider_with_user_id(/*user_id*/ None));
+    assert_eq!(client.state.provider.info().user_id, None);
+
+    let request = build_test_responses_request(&client);
+    assert!(request.user.is_none());
+
+    // Omission, not `"user": null`: a provider that never set the field must see
+    // exactly the request body it saw before this field existed.
+    let body = serde_json::to_value(&request).expect("serialize request body");
+    assert!(
+        !body
+            .as_object()
+            .expect("request body is an object")
+            .contains_key("user"),
+    );
+}
+
+#[test]
+fn distinct_arms_never_share_one_cache_isolation_identity() {
+    let tcp = build_test_responses_request(&test_model_client_with_provider(
+        provider_with_user_id(Some("phase8d_tcp_accumulator_r01")),
+    ));
+    let mpc = build_test_responses_request(&test_model_client_with_provider(
+        provider_with_user_id(Some("phase8d_mpc_r01")),
+    ));
+
+    assert_eq!(tcp.user.as_deref(), Some("phase8d_tcp_accumulator_r01"));
+    assert_eq!(mpc.user.as_deref(), Some("phase8d_mpc_r01"));
+    assert_ne!(tcp.user, mpc.user);
+}
+
+#[test]
+fn the_same_arm_reuses_one_cache_isolation_identity_across_requests() {
+    let client =
+        test_model_client_with_provider(provider_with_user_id(Some("phase8d_native_fixed_r01")));
+
+    let first = build_test_responses_request(&client);
+    let second = build_test_responses_request(&client);
+    assert_eq!(first.user, second.user);
+    assert_eq!(first.user.as_deref(), Some("phase8d_native_fixed_r01"));
+}
+
+#[test]
+fn compaction_body_carries_the_same_cache_isolation_identity() {
+    // The compaction projection is hand-maintained, so a serve-only field would
+    // silently vanish from summary requests and land that arm's summaries in a
+    // different cache namespace than its serves.
+    let input: Vec<ResponseItem> = vec![];
+    let payload = codex_api::CompactionInput {
+        model: "deepseek-flash",
+        input: &input,
+        instructions: "summarize",
+        tools: None,
+        parallel_tool_calls: false,
+        reasoning: None,
+        service_tier: None,
+        prompt_cache_key: None,
+        text: None,
+        user: Some("phase8d_tcp_accumulator_r01"),
+        access_programs: None,
+    };
+
+    let body = serde_json::to_value(&payload).expect("serialize compaction body");
+    assert_eq!(
+        body.get("user").and_then(|value| value.as_str()),
+        Some("phase8d_tcp_accumulator_r01"),
+    );
+}
+
+#[test]
+fn compaction_body_omits_user_when_unset() {
+    let input: Vec<ResponseItem> = vec![];
+    let payload = codex_api::CompactionInput {
+        model: "deepseek-flash",
+        input: &input,
+        instructions: "summarize",
+        tools: None,
+        parallel_tool_calls: false,
+        reasoning: None,
+        service_tier: None,
+        prompt_cache_key: None,
+        text: None,
+        user: None,
+        access_programs: None,
+    };
+
+    let body = serde_json::to_value(&payload).expect("serialize compaction body");
+    assert!(
+        !body
+            .as_object()
+            .expect("compaction body is an object")
+            .contains_key("user"),
+    );
+}
+
+#[test]
+fn frozen_request_shaping_configuration_is_identical_across_all_five_arms() {
+    // The arms differ ONLY in their cache-isolation identity. Everything that
+    // decides what the model is asked to do -- the model, the instructions, the
+    // tool set, tool choice, reasoning controls, the include list -- must be
+    // byte-identical, otherwise a measured difference could not be attributed to
+    // the context policy.
+    //
+    // Deliberately excluded: the per-thread identity fields. Each arm runs in its
+    // own thread, so `client_metadata.*` and `prompt_cache_key` differ across arms
+    // by construction and are not part of the frozen configuration.
+    const PER_THREAD_FIELDS: [&str; 2] = ["client_metadata", "prompt_cache_key"];
+    const REQUEST_SHAPING_FIELDS: [&str; 10] = [
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "model",
+        "instructions",
+        "reasoning",
+        "include",
+        "store",
+        "stream",
+        "text",
+    ];
+
+    let arms = [
+        "phase8d_native_fixed_r01",
+        "phase8d_controlled_fixed_r01",
+        "phase8d_tcp_accumulator_r01",
+        "phase8d_mpc_h1_r01",
+        "phase8d_mpc_r01",
+    ];
+
+    let mut baseline: Option<Vec<(String, Option<serde_json::Value>)>> = None;
+    for arm in arms {
+        let request = build_test_responses_request(&test_model_client_with_provider(
+            provider_with_user_id(Some(arm)),
+        ));
+        let body = serde_json::to_value(&request).expect("serialize request body");
+        let body = body.as_object().expect("request body is an object");
+
+        assert_eq!(body.get("user").and_then(|value| value.as_str()), Some(arm));
+        for field in PER_THREAD_FIELDS {
+            assert!(
+                !REQUEST_SHAPING_FIELDS.contains(&field),
+                "{field} cannot be both per-thread and request-shaping"
+            );
+        }
+
+        let projection: Vec<(String, Option<serde_json::Value>)> = REQUEST_SHAPING_FIELDS
+            .iter()
+            .map(|field| {
+                (
+                    field.to_string(),
+                    body.get(*field).cloned(),
+                )
+            })
+            .collect();
+
+        match &baseline {
+            None => baseline = Some(projection),
+            Some(expected) => assert_eq!(
+                &projection, expected,
+                "{arm} differs from the first arm in its request-shaping configuration, \
+                 so the frozen configuration is not identical across arms"
+            ),
+        }
+    }
+
+    let projection = baseline.expect("at least one arm was checked");
+    // Guard against a vacuous pass: the projection must carry real values.
+    let present = projection.iter().filter(|(_, value)| value.is_some()).count();
+    assert!(
+        present >= REQUEST_SHAPING_FIELDS.len() - 1,
+        "the request-shaping projection is mostly empty, so the comparison proves nothing"
+    );
+}

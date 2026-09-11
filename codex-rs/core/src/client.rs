@@ -331,6 +331,7 @@ fn responses_request_properties_match(
         service_tier: previous_service_tier,
         prompt_cache_key: previous_prompt_cache_key,
         text: previous_text,
+        user: previous_user,
         client_metadata: _,
         access_programs: _,
     } = previous;
@@ -349,6 +350,7 @@ fn responses_request_properties_match(
         service_tier: current_service_tier,
         prompt_cache_key: current_prompt_cache_key,
         text: current_text,
+        user: current_user,
         client_metadata: _,
         access_programs: _,
     } = current;
@@ -367,6 +369,8 @@ fn responses_request_properties_match(
         && previous_service_tier == current_service_tier
         && previous_prompt_cache_key == current_prompt_cache_key
         && previous_text == current_text
+        // The cache-isolation identity is part of the reused context's identity.
+        && previous_user == current_user
 }
 
 fn response_items_equal_ignoring_internal_metadata(
@@ -622,6 +626,7 @@ impl ModelClient {
             service_tier,
             prompt_cache_key,
             text,
+            user,
             ..
         } = request;
         self.prepare_response_items_for_request(&mut input);
@@ -635,6 +640,9 @@ impl ModelClient {
             service_tier: service_tier.as_deref(),
             prompt_cache_key: prompt_cache_key.as_deref(),
             text,
+            // Compaction is a provider request too: the summary must land in the
+            // same per-arm cache namespace as the serve it belongs to.
+            user: user.as_deref(),
             access_programs: cyber_access_program::for_auth(
                 client_setup.auth.as_ref(),
                 prompt.cyber_access_program,
@@ -990,6 +998,10 @@ impl ModelClient {
             service_tier,
             prompt_cache_key,
             text,
+            // A static per-provider identifier, constant for the whole process,
+            // so every serve and every compact summary of one arm shares one
+            // provider-side cache namespace.
+            user: self.state.provider.info().user_id.clone(),
             client_metadata: Some(responses_metadata.client_metadata()),
             access_programs: None,
         };
