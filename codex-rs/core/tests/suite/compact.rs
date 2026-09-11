@@ -61,6 +61,7 @@ use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::mount_compact_json_once;
 use core_test_support::responses::mount_compact_response_sequence;
+use core_test_support::responses::mount_response_once;
 use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
@@ -3014,6 +3015,150 @@ async fn tcp_accumulator_compacts_through_the_native_compactor_then_serves_once(
     assert_eq!(starts[0]["compaction_kind"], "policy");
     assert_eq!(starts[0]["compaction_id"], "phase8t-tcp-run:compact:0");
     assert_eq!(starts[0]["reset_id"], "phase8t-tcp-run:reset:0");
+}
+
+/// HARD GATE 0: when the TCP arm selects COMPACT and the real traditional
+/// compact-summary invocation fails, the run must fail closed.  No rebuilt
+/// post-COMPACT request, no `compact_feedback`, no reset-estimator update, no
+/// TCP accumulator reset, and no follow-up normal serve may be produced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_accumulator_failed_compact_summary_is_fail_closed() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    // The compact summary is the only provider request this trajectory may
+    // issue, so exactly one failing response is mounted and no follow-up is
+    // queued: a second request would be unmatched, and the request-count and
+    // ledger assertions below pin that down independently.
+    let summary_log = mount_response_once(
+        &server,
+        sse_response(sse_failed(
+            "resp-tcp-summary-fail",
+            "server_error",
+            "tcp compact summary failed",
+        )),
+    )
+    .await;
+
+    let policy_dir = TempDir::new().expect("create policy fixture directory");
+    let policy_path = policy_dir.path().join("tcp-failed-summary-policy.jsonl");
+    let raw_log_path =
+        AbsolutePathBuf::from_absolute_path(&policy_path).expect("policy log is absolute");
+    let (mut policy, protocol_log) =
+        tcp_bridge_fixture(&policy_dir, raw_log_path, "compact_at_epoch_zero");
+    let request_path = policy_dir.path().join("tcp-failed-summary-requests.jsonl");
+    policy.request_raw_log_path =
+        Some(AbsolutePathBuf::from_absolute_path(&request_path).expect("request log is absolute"));
+
+    let mut model_provider = non_openai_model_provider(&server);
+    // Fail fast: the accepted retry lifecycle must not mask the primary
+    // failure, and this trajectory should observe exactly one attempt.
+    model_provider.stream_max_retries = Some(0);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config
+            .features
+            .disable(Feature::TokenBudget)
+            .expect("disable TokenBudget");
+        config.experimental_context_policy = policy;
+    });
+    let test = builder.build(&server).await.expect("build test codex");
+
+    submit_tcp_turn(&test.codex, "tcp failed compact summary").await;
+    let event = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::Error(_) | EventMsg::TurnComplete(_))
+    })
+    .await;
+    let EventMsg::Error(error) = &event else {
+        panic!(
+            "a failed compact summary must fail the run closed instead of completing: {event:?}"
+        );
+    };
+    // (3) the failure surfaces through the accepted typed provider semantics
+    // and carries the real summary failure, not a bridge or unrelated error.
+    assert!(
+        error.message.contains("tcp compact summary failed"),
+        "the run must fail with the real compact-summary provider failure, got: {}",
+        error.message
+    );
+    assert!(
+        error
+            .message
+            .contains("stream disconnected before completion"),
+        "the summary failure must keep its typed provider-stream semantics, got: {}",
+        error.message
+    );
+    let _ = test.codex.submit(Op::Shutdown).await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    // (1) the TCP decision really was COMPACT, and it was taken at the
+    // canonical pre-invocation seam through the phase8b bridge.
+    let records = read_policy_records(&policy_path);
+    assert_eq!(records[0]["event"], "decision");
+    assert_eq!(records[0]["action"], "COMPACT");
+    assert_eq!(records[0]["compaction_reason"], "context_limit");
+    assert_eq!(records[0]["protocol_version"], "phase8b-v1");
+
+    // (2) the traditional native compactor is the path that was attempted.
+    let requests = summary_log.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "a failed summary must not be followed by another provider request"
+    );
+    assert!(
+        body_contains_text(&requests[0].body_json().to_string(), SUMMARIZATION_PROMPT),
+        "the single failed request must be the traditional compact summary"
+    );
+
+    // (4) no rebuilt post-COMPACT state was ever produced.
+    assert!(
+        !records
+            .iter()
+            .any(|record| record["event"] == "ready_to_invoke"),
+        "a failed summary must not produce rebuilt-context ready evidence: {records:?}"
+    );
+
+    // (5)(7)(8)(9) no compact_feedback means neither the TCP accumulator nor
+    // the reset estimator can have been advanced by this failed COMPACT.
+    let protocol = read_bridge_protocol(&protocol_log);
+    let kinds = protocol
+        .iter()
+        .map(|event| event["type"].as_str().expect("event type"))
+        .collect::<Vec<_>>();
+    assert!(
+        !kinds.contains(&"compact_feedback"),
+        "a failed summary must never be reported back as a successful COMPACT: {kinds:?}"
+    );
+    assert!(
+        protocol.iter().all(|event| event["feedback"].is_null()),
+        "no compact-feedback payload may be fabricated"
+    );
+    assert_eq!(protocol[0]["controller_mode"], "tcp_accumulator");
+
+    // (3)(6)(10) the ledger keeps the failed attempt typed, records no serve,
+    // and never claims a successful compaction/reset linkage.
+    let request_records = read_request_records(&request_path);
+    let starts = request_records
+        .iter()
+        .filter(|record| record["event"] == "request_started")
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 1, "exactly one logical summary request");
+    assert_eq!(starts[0]["request_purpose"], "compact_summary");
+    assert_eq!(starts[0]["arm"], "tcp_accumulator");
+    assert_eq!(starts[0]["decision_epoch"], 0);
+    assert_eq!(starts[0]["decision_action"], "COMPACT");
+    assert_eq!(starts[0]["compaction_kind"], "policy");
+    assert!(
+        !request_records
+            .iter()
+            .any(|record| record["request_purpose"] == "serve"),
+        "no normal serve may be logged after a failed summary: {request_records:?}"
+    );
 }
 
 /// Build a codex session bound to a TCP policy fixture.
