@@ -63,6 +63,114 @@ fn tcp_config(raw_log_path: AbsolutePathBuf) -> ContextPolicyConfig {
     }
 }
 
+fn python() -> AbsolutePathBuf {
+    let candidates = if cfg!(windows) {
+        ["python", "python3"]
+    } else {
+        ["python3", "python"]
+    };
+    candidates
+        .into_iter()
+        .find_map(|candidate| which::which(candidate).ok())
+        .map(|path| absolute(&path))
+        .expect("the diagnostics seam tests require Python")
+}
+
+/// A minimal TCP bridge that returns a diagnostics carrier when asked for one.
+///
+/// It echoes the protocol identity the bridge validates, answers the
+/// handshake, and then returns one KEEP decision. `behavior` selects whether
+/// that decision carries diagnostics at all, so the two cases -- policy
+/// supplied evidence, and no evidence offered -- are produced by the same
+/// fixture rather than by two divergent ones.
+fn diagnostics_script(directory: &std::path::Path) -> AbsolutePathBuf {
+    let path = directory.join("diagnostics_bridge_fixture.py");
+    std::fs::write(
+        &path,
+        r#"import json
+import sys
+
+diagnostics = {
+    "controller_mode": "tcp_accumulator",
+    "rent_increment": 7,
+    "accumulator_before_increment": 11,
+    "accumulator_after_increment": 18,
+    "buy_price": 42,
+    "summary_cost": 3,
+    "cache_loss_diagnostic": 5,
+    "predicted_postcompact_length": 900,
+    "keep_feasible": True,
+    "compact_feasible": True,
+    "decision_mode": "tcp_accumulator",
+}
+behavior = sys.argv[1]
+for line in sys.stdin:
+    request = json.loads(line)
+    response = {key: request[key] for key in (
+        "protocol_version", "request_id", "run_id", "task_id",
+        "replicate_id", "thread_id", "epoch")}
+    if request["type"] == "initialize":
+        response["type"] = "initialized"
+        response["controller_mode"] = request.get("controller_mode")
+    else:
+        response["type"] = "decision"
+        response["action"] = "KEEP"
+        response["decision_mode"] = "tcp_accumulator"
+        response["predicted_post_compact_L"] = None
+        if behavior == "with_diagnostics":
+            response["diagnostics"] = diagnostics
+    print(json.dumps(response, separators=(",", ":")), flush=True)
+"#,
+    )
+    .expect("write the diagnostics bridge fixture");
+    absolute(&path)
+}
+
+/// The same payload the fixture sends, as the host should record it.
+fn expected_tcp_diagnostics() -> serde_json::Value {
+    serde_json::json!({
+        "controller_mode": "tcp_accumulator",
+        "rent_increment": 7,
+        "accumulator_before_increment": 11,
+        "accumulator_after_increment": 18,
+        "buy_price": 42,
+        "summary_cost": 3,
+        "cache_loss_diagnostic": 5,
+        "predicted_postcompact_length": 900,
+        "keep_feasible": true,
+        "compact_feasible": true,
+        "decision_mode": "tcp_accumulator",
+    })
+}
+
+fn diagnostics_bridge_config(
+    raw_log_path: AbsolutePathBuf,
+    script: AbsolutePathBuf,
+    behavior: &str,
+) -> ContextPolicyConfig {
+    ContextPolicyConfig {
+        mode: ContextPolicyMode::TcpAccumulator,
+        run_id: Some("run-1".to_string()),
+        task_id: Some("task-1".to_string()),
+        replicate_id: Some(2),
+        raw_log_path: Some(raw_log_path),
+        bridge_command: Some(python()),
+        bridge_args: vec![script.to_string_lossy().into_owned(), behavior.to_string()],
+        bridge_timeout_ms: Some(10_000),
+        controller_config_id: Some("fixture-controller-v1".to_string()),
+        z_schema_version: Some("phase4-observable-v1".to_string()),
+        ..Default::default()
+    }
+}
+
+fn read_records(path: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .expect("read records")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSONL"))
+        .collect()
+}
+
 fn prompt() -> Prompt {
     Prompt {
         base_instructions: BaseInstructions {
@@ -126,7 +234,68 @@ async fn fixed_and_external_stub_share_decision_and_recording_seam() {
         assert_eq!(records[0]["compaction_reason"], "context_limit");
         assert_eq!(records[1]["event"], "ready_to_invoke");
         assert_eq!(records[1]["epoch"], 0);
+
+        // A mode with no external policy has no policy diagnostics, and the
+        // record says so rather than inventing a set. The carrier appears on
+        // the decision and nowhere else, so a reader cannot mistake its
+        // absence on another event for a policy that supplied nothing.
+        assert_eq!(records[0]["decision_diagnostics"], serde_json::Value::Null);
+        assert!(records[1].get("decision_diagnostics").is_none());
     }
+}
+
+#[tokio::test]
+async fn tcp_bridge_diagnostics_reach_the_decision_record() {
+    let directory = tempfile::tempdir().expect("create temp dir");
+    let path = directory.path().join("tcp-diagnostics.jsonl");
+    let script = diagnostics_script(directory.path());
+    let mut seam = ContextPolicySeam::new(diagnostics_bridge_config(
+        absolute(&path),
+        script,
+        "with_diagnostics",
+    ));
+
+    let decision = seam
+        .decide(0, observation())
+        .await
+        .expect("record decision")
+        .expect("tcp decision");
+    assert_eq!(decision.action, Some(ContextPolicyAction::Keep));
+    seam.record_ready_to_invoke(decision, observation())
+        .await
+        .expect("record invocation");
+
+    let records = read_records(&path);
+    assert_eq!(records.len(), 2);
+    // The whole point: the paid run's plan evidence survives into the record
+    // the reconstruction reads, unchanged and uninterpreted.
+    assert_eq!(
+        records[0]["decision_diagnostics"],
+        expected_tcp_diagnostics()
+    );
+}
+
+#[tokio::test]
+async fn a_bridge_that_supplies_no_diagnostics_records_null_not_defaults() {
+    let directory = tempfile::tempdir().expect("create temp dir");
+    let path = directory.path().join("tcp-bare.jsonl");
+    let script = diagnostics_script(directory.path());
+    let mut seam =
+        ContextPolicySeam::new(diagnostics_bridge_config(absolute(&path), script, "bare"));
+
+    let decision = seam
+        .decide(0, observation())
+        .await
+        .expect("record decision")
+        .expect("tcp decision");
+    seam.record_ready_to_invoke(decision, observation())
+        .await
+        .expect("record invocation");
+
+    let records = read_records(&path);
+    assert_eq!(records[0]["decision_diagnostics"], serde_json::Value::Null);
+    // Not a partial object, and not the fields the host happens to know about.
+    assert_eq!(records[0]["decision_mode"], "tcp_accumulator");
 }
 
 #[tokio::test]
@@ -169,11 +338,125 @@ fn planner_emergency_is_a_typed_actionless_decision() {
         "action": null,
         "predicted_post_compact_L": null,
     });
-    let (action, predicted, mode) =
-        parse_bridge_decision(&response).expect("valid planner emergency");
-    assert_eq!(action, None);
-    assert_eq!(predicted, None);
-    assert_eq!(mode, "emergency");
+    let parsed = parse_bridge_decision(&response).expect("valid planner emergency");
+    assert_eq!(parsed.action, None);
+    assert_eq!(parsed.predicted, None);
+    assert_eq!(parsed.mode, "emergency");
+}
+
+// --------------------------------------------------------------------------
+// The policy's diagnostics are evidence, and the host is not their author
+// --------------------------------------------------------------------------
+//
+// `decisions.jsonl` is the only record of what a paid run did. The host parses
+// exactly the three fields it must act on and forwards the rest untouched, so
+// that a plan can be reconstructed from the record rather than by re-running a
+// policy whose state has moved on. Nothing here is TCP-specific on purpose: the
+// same carrier has to hold an MPC plan's evidence without a second host change.
+
+/// The full diagnostic payload a TCP bridge returns for a real decision.
+fn tcp_bridge_diagnostics() -> serde_json::Value {
+    serde_json::json!({
+        "controller_mode": "tcp_accumulator",
+        "rent_increment": 7,
+        "accumulator_before_increment": 11,
+        "accumulator_after_increment": 18,
+        "buy_price": 42,
+        "summary_cost": 3,
+        "cache_loss_diagnostic": 5,
+        "predicted_postcompact_length": 900,
+        "keep_feasible": true,
+        "compact_feasible": true,
+        "decision_mode": "tcp_accumulator",
+    })
+}
+
+#[test]
+fn tcp_bridge_diagnostics_are_preserved_verbatim() {
+    let diagnostics = tcp_bridge_diagnostics();
+    let response = serde_json::json!({
+        "type": "decision",
+        "decision_mode": "tcp_accumulator",
+        "action": "KEEP",
+        "predicted_post_compact_L": null,
+        "diagnostics": diagnostics,
+    });
+
+    let parsed = parse_bridge_decision(&response).expect("valid tcp decision");
+
+    assert_eq!(parsed.action, Some(ContextPolicyAction::Keep));
+    assert_eq!(parsed.mode, "tcp_accumulator");
+    assert_eq!(parsed.diagnostics, Some(diagnostics));
+}
+
+#[test]
+fn mpc_style_diagnostics_survive_without_tcp_specific_host_logic() {
+    // Deliberately unlike the TCP payload: nested objects, arrays, and none of
+    // the accumulator keys. If the host had learned any of TCP's vocabulary,
+    // this is where it would show.
+    let diagnostics = serde_json::json!({
+        "q_keep": 1.5,
+        "q_compact": 2.25,
+        "planner": {"H": 2, "delta": 0.5, "M": 64},
+        "scenarios": [{"length": 10, "weight": 0.5}, {"length": 20, "weight": 0.5}],
+        "workload_estimator_version": "phase8d-v1",
+        "reset_estimator_version": "phase8d-v1",
+    });
+    let response = serde_json::json!({
+        "type": "decision",
+        "decision_mode": "monetary",
+        "action": "COMPACT",
+        "predicted_post_compact_L": 1234,
+        "diagnostics": diagnostics,
+    });
+
+    let parsed = parse_bridge_decision(&response).expect("valid mpc decision");
+
+    assert_eq!(parsed.action, Some(ContextPolicyAction::Compact));
+    assert_eq!(parsed.predicted, Some(1234));
+    assert_eq!(parsed.mode, "monetary");
+    assert_eq!(parsed.diagnostics, Some(diagnostics));
+}
+
+#[test]
+fn a_bridge_response_without_diagnostics_carries_none() {
+    let response = serde_json::json!({
+        "type": "decision",
+        "decision_mode": "monetary",
+        "action": "KEEP",
+        "predicted_post_compact_L": null,
+    });
+
+    let parsed = parse_bridge_decision(&response).expect("valid decision");
+
+    assert_eq!(
+        parsed.diagnostics, None,
+        "an absent carrier must not be fabricated"
+    );
+}
+
+#[test]
+fn mandatory_fields_stay_fail_closed_when_diagnostics_are_present() {
+    // A rich diagnostic payload must not buy a malformed decision a pass.
+    for response in [
+        serde_json::json!({
+            "action": "KEEP", "diagnostics": tcp_bridge_diagnostics(),
+        }),
+        serde_json::json!({
+            "decision_mode": "monetary", "action": "SIDEWAYS",
+            "diagnostics": tcp_bridge_diagnostics(),
+        }),
+        serde_json::json!({
+            "decision_mode": "monetary", "action": "COMPACT",
+            "predicted_post_compact_L": null,
+            "diagnostics": tcp_bridge_diagnostics(),
+        }),
+    ] {
+        assert!(
+            parse_bridge_decision(&response).is_err(),
+            "a decision missing a mandatory field was accepted: {response}"
+        );
+    }
 }
 
 #[tokio::test]

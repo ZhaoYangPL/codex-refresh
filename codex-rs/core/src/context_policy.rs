@@ -25,6 +25,18 @@ const K_KIND_PRIOR: &str = "codex_pre_request_common_prefix_v1";
 const K_KIND_NO_PRIOR: &str = "codex_pre_request_no_prior_v1";
 const Z_SCHEMA_VERSION: &str = "phase4-observable-v1";
 
+/// The response field an external policy uses to return its own diagnostics.
+///
+/// It is a single opaque object on purpose. The host parses the three fields it
+/// must act on (`decision_mode`, `action`, `predicted_post_compact_L`) and
+/// forwards the rest without interpreting it, so TCP's accumulator evidence and
+/// an MPC plan's scenario evidence travel through the same carrier and a new
+/// diagnostic never requires a host change.
+const BRIDGE_DIAGNOSTICS_FIELD: &str = "diagnostics";
+
+/// The record field the carrier is written to.
+const DECISION_DIAGNOSTICS_FIELD: &str = "decision_diagnostics";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum ContextPolicyAction {
@@ -347,7 +359,7 @@ impl ContextPolicySeam {
             return Ok(None);
         }
         let observation = observation.with_prefix(self.previous_ready.as_ref());
-        let (action, predicted, decision_mode) = match self.config.mode {
+        let (action, predicted, decision_mode, diagnostics) = match self.config.mode {
             ContextPolicyMode::NativeFixed => unreachable!(),
             ContextPolicyMode::ControlledFixed => (
                 Some(
@@ -361,6 +373,7 @@ impl ContextPolicySeam {
                 ),
                 None,
                 "fixed_threshold".to_string(),
+                None,
             ),
             ContextPolicyMode::ExternalStub => (
                 Some(match self.config.external_stub {
@@ -373,6 +386,7 @@ impl ContextPolicySeam {
                 }),
                 None,
                 "external_stub".to_string(),
+                None,
             ),
             // The TCP baseline and the MPC arms share one seam: same bridge
             // handshake, same formal L/K/W state message, same response parser.
@@ -401,8 +415,13 @@ impl ContextPolicySeam {
                 if response.get("type").and_then(Value::as_str) != Some("decision") {
                     return Err(infrastructure("expected decision response"));
                 }
-                let (action, predicted, mode) = parse_bridge_decision(&response)?;
-                (action, predicted, mode)
+                let parsed = parse_bridge_decision(&response)?;
+                (
+                    parsed.action,
+                    parsed.predicted,
+                    parsed.mode,
+                    parsed.diagnostics,
+                )
             }
         };
         let decision = ContextPolicyDecision {
@@ -413,7 +432,7 @@ impl ContextPolicySeam {
             predicted_post_compact_l: predicted,
         };
         self.last_observation = Some(observation.clone());
-        let record = self.record("decision", &decision, &observation);
+        let record = self.record("decision", &decision, &observation, diagnostics.as_ref());
         self.append(&record).await?;
         Ok(Some(decision))
     }
@@ -444,7 +463,7 @@ impl ContextPolicySeam {
                 return Err(infrastructure("compact feedback was not accepted"));
             }
         }
-        let record = self.record("ready_to_invoke", &decision, &observation);
+        let record = self.record("ready_to_invoke", &decision, &observation, None);
         self.append(&record).await?;
         self.previous_ready = Some(observation);
         self.previous_epoch = Some(decision.epoch);
@@ -622,8 +641,9 @@ impl ContextPolicySeam {
         event: &str,
         decision: &ContextPolicyDecision,
         observation: &ContextPolicyObservation,
+        diagnostics: Option<&Value>,
     ) -> Value {
-        serde_json::json!({"event": event,
+        let mut record = serde_json::json!({"event": event,
             "protocol_version": if uses_external_bridge(self.config.mode) { PROTOCOL_VERSION } else { PHASE8A_PROTOCOL_VERSION },
             "run_id": self.run_id(), "task_id": self.task_id(), "replicate_id": self.replicate_id(),
             "thread_id": observation.thread_id, "turn_id": observation.turn_id, "epoch": decision.epoch,
@@ -644,7 +664,19 @@ impl ContextPolicySeam {
             "model_visible_request_hash": observation.request_hash,
             "prior_request_hash": observation.prior_request_hash,
             "z_schema_version": Z_SCHEMA_VERSION, "z": {},
-            "model_visible_request": observation.model_visible_request})
+            "model_visible_request": observation.model_visible_request});
+        // Only a decision record has a policy decision to describe. Writing the
+        // carrier as null on `ready_to_invoke` would invite reading "the policy
+        // supplied no diagnostics" off an event that never carried a decision.
+        if event == "decision"
+            && let Some(target) = record.as_object_mut()
+        {
+            target.insert(
+                DECISION_DIAGNOSTICS_FIELD.to_string(),
+                diagnostics.cloned().unwrap_or(Value::Null),
+            );
+        }
+        record
     }
 
     fn run_id(&self) -> &str {
@@ -746,9 +778,15 @@ fn infrastructure(message: impl Into<String>) -> io::Error {
     ))
 }
 
-fn parse_bridge_decision(
-    response: &Value,
-) -> io::Result<(Option<ContextPolicyAction>, Option<i64>, String)> {
+/// The three fields the host must act on, plus the policy's own evidence.
+struct BridgeDecision {
+    action: Option<ContextPolicyAction>,
+    predicted: Option<i64>,
+    mode: String,
+    diagnostics: Option<Value>,
+}
+
+fn parse_bridge_decision(response: &Value) -> io::Result<BridgeDecision> {
     let mode = response
         .get("decision_mode")
         .and_then(Value::as_str)
@@ -769,7 +807,20 @@ fn parse_bridge_decision(
     if action == Some(ContextPolicyAction::Compact) && predicted.is_none() {
         return Err(infrastructure("COMPACT response lacks reset prediction"));
     }
-    Ok((action, predicted, mode))
+    // Whatever else the policy put in its decision response is evidence, and
+    // the host is not entitled to an opinion about it. It is carried out
+    // verbatim so that a plan can be reconstructed from the record without
+    // re-running the policy, and so that a new diagnostic costs the host
+    // nothing: the fields are the policy's, not the host's. Nothing is
+    // synthesised here, so an absent carrier stays absent rather than being
+    // filled in with defaults the policy never produced.
+    let diagnostics = response.get(BRIDGE_DIAGNOSTICS_FIELD).cloned();
+    Ok(BridgeDecision {
+        action,
+        predicted,
+        mode,
+        diagnostics,
+    })
 }
 
 #[cfg(test)]
